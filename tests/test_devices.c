@@ -549,11 +549,14 @@ static void test_guest_programs(void) {
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (hv_machine_init(&m, 4 << 20) != 0) return 1;
-    char root_path[1024], aux_path[1024];
-    snprintf(root_path, sizeof root_path, "%s/hv-test-root.img", work_dir());
-    snprintf(aux_path, sizeof aux_path, "%s/hv-test-aux.img", work_dir());
+    char work[1024], root_path[1100], aux_path[1100];
+    snprintf(work, sizeof work, "%s/henge-devices.XXXXXX", work_dir());
+    if (!mkdtemp(work)) return 1;
+    snprintf(root_path, sizeof root_path, "%s/test-root.img", work);
+    snprintf(aux_path, sizeof aux_path, "%s/test-aux.img", work);
     if (make_disk(root_path, 1 << 20, 1) || make_disk(aux_path, 256 << 10, 2)) {
-        printf("cannot create test disks in %s\n", work_dir());
+        printf("cannot create test disks in %s\n", work);
+        unlink(root_path); unlink(aux_path); rmdir(work);
         return 1;
     }
     static HvDisk root, aux;
@@ -600,6 +603,7 @@ int main(void) {
     hv_disk_close(&aux);
     unlink(root_path);
     unlink(aux_path);
+    rmdir(work);
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;
 }

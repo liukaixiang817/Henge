@@ -27,6 +27,7 @@ struct SessionView: View {
     @AppStorage("henge.cursor.scale") private var cursorScale = Device.isPad ? 1 : 3
     @AppStorage("henge.cursor.sharp") private var sharpCursor = true
     @AppStorage(HardwareMouse.scrollSpeedKey) private var scrollSpeed = 0.3
+    @AppStorage("henge.rosetta") private var intelApps = false
 
     @State private var typing = false
     @State private var zoomed = false
@@ -588,6 +589,11 @@ struct SessionView: View {
         guard !Task.isCancelled else { return }
         UIApplication.shared.isIdleTimerDisabled = true
         HardwareMouse.shared.start()
+        guard JITBootstrap.ready else {
+            error = JITBootstrap.lastFailure ?? "Henge's JIT code region is not ready. Tap Turn On JIT in Henge, then try again."
+            return
+        }
+        VolumeClicks.shared.start()
         let ram = GuestMemory.prepare(mac)
         HengeLog.log("session", "available memory \(henge_available_memory() >> 20) MB")
         guard ram >= 1024 else {
@@ -605,6 +611,7 @@ struct SessionView: View {
             henge_vm_set_display_mm(0, 0)
         }
         HengeLog.log("session", "screen \(mac.screen.width)x\(mac.screen.height) retina \(mac.isRetina)")
+        henge_vm_set_rosetta(intelApps ? 1 : 0)
         var rc: Int32 = -1
         if InstantResume.enabled, let at = InstantResume.saved(for: mac, ramMB: ram, cpus: cpus) {
             HengeLog.log("resume", "picking up the Mac saved \(Int(Date().timeIntervalSince(at))) s ago")
@@ -664,6 +671,7 @@ struct SessionView: View {
                 StickyKeys.shared.releaseAll()
                 HardwareKeys.releaseAll()
                 HardwareMouse.shared.stop()
+                VolumeClicks.shared.stop()
                 UIApplication.shared.isIdleTimerDisabled = false
                 HengeLog.log("session", "showing stopped Mac: \(String(cString: henge_vm_exit_reason()))")
                 if henge_vm_exit_outcome() == Int32(HENGE_VM_OUTCOME_RESTART.rawValue) && henge_vm_can_start() != 0 {

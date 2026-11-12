@@ -24,6 +24,10 @@ static HvInsnKind classify_hint(uint32_t insn) {
 }
 
 static HvInsnKind classify_system(uint32_t insn) {
+    /* FlagM/FlagM2 occupy the MSR-immediate space, but are unprivileged
+       operations on the live NZCV register, not writes to guest PSTATE. */
+    if (insn == 0xd500401fu || insn == 0xd500403fu || insn == 0xd500405fu)
+        return HV_INSN_COPY; /* CFINV, XAFLAG, AXFLAG */
     uint32_t l = (insn >> 21) & 1;
     uint32_t op0 = (insn >> 19) & 3;
     uint32_t op1 = (insn >> 16) & 7;

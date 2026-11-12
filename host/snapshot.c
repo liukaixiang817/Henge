@@ -85,6 +85,7 @@ typedef struct CpuState {
     uint64_t ttbr0_el1, ttbr1_el1, mair_el1, amair_el1, vbar_el1, afsr0_el1, afsr1_el1, contextidr_el1;
     uint64_t cpacr_el1, mdscr_el1, csselr_el1, cntkctl_el1, actlr_el1;
     uint64_t cntv_ctl, cntv_cval, cntp_ctl, cntp_cval;
+    uint64_t apflags, aspsr_el1, afpcr_el0; /* Rosetta's Apple integer and floating-point controls */
 } CpuState;
 
 static int fail(char *err, size_t n, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
@@ -215,6 +216,7 @@ static void cpu_get(const HvCpu *c, CpuState *s) {
     s->cpacr_el1 = c->cpacr_el1, s->mdscr_el1 = c->mdscr_el1, s->csselr_el1 = c->csselr_el1, s->cntkctl_el1 = c->cntkctl_el1;
     s->actlr_el1 = c->actlr_el1;
     s->cntv_ctl = c->cntv_ctl, s->cntv_cval = c->cntv_cval, s->cntp_ctl = c->cntp_ctl, s->cntp_cval = c->cntp_cval;
+    s->apflags = c->apflags, s->aspsr_el1 = c->aspsr_el1, s->afpcr_el0 = c->afpcr_el0;
 }
 
 static void cpu_put(HvCpu *c, const CpuState *s) {
@@ -233,6 +235,8 @@ static void cpu_put(HvCpu *c, const CpuState *s) {
     c->cpacr_el1 = s->cpacr_el1, c->mdscr_el1 = s->mdscr_el1, c->csselr_el1 = s->csselr_el1, c->cntkctl_el1 = s->cntkctl_el1;
     c->actlr_el1 = s->actlr_el1;
     c->cntv_ctl = s->cntv_ctl, c->cntv_cval = s->cntv_cval, c->cntp_ctl = s->cntp_ctl, c->cntp_cval = s->cntp_cval;
+    c->apflags = s->apflags, c->aspsr_el1 = s->aspsr_el1, c->afpcr_el0 = s->afpcr_el0;
+    c->fpcr_native = ~0ull; /* hv_run reconstructs the effective host controls on the new CPU thread */
     c->excl_addr = ~0ull; /* an LDXR before the save: its STXR fails and the guest tries again, as after any interrupt */
     c->exit_req = 0;
     atomic_store(&c->halted, HV_HALT_NONE);

@@ -12,7 +12,8 @@
 #include <TargetConditionals.h>
 #endif
 
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+/* The host regression runs this allocator with a simulated debugserver. */
+#if defined(__APPLE__) && (TARGET_OS_IPHONE || defined(HENGE_JIT_ALLOCATOR_TEST))
 
 #include <errno.h>
 #include <mach/mach.h>
@@ -577,9 +578,11 @@ static bool henge_prewarm_done;
 
 HENGE_EXPORT bool henge_ios_jit_prewarm(size_t bytes)
 {
-    if (henge_prewarm_done) {
-        return henge_prewarmed.rw_addr != NULL;
-    }
+    /* Keep successful regions for this launch, but let an explicit prewarm
+     * retry after a new attach. CS_DEBUGGED can precede the script's trap loop;
+     * caching that first failure made enabling JIT again impossible. The lazy
+     * allocator below still never retries an unanswered prewarm on its own. */
+    if (henge_prewarmed.rw_addr) return true;
     henge_prewarm_done = true;
     henge_ios_hold_high();
     henge_prewarmed = henge_ios_jit_allocate_real(bytes);
@@ -788,6 +791,7 @@ static HengeDualMapping henge_ios_jit_allocate_real(size_t bytes)
     if (kr != KERN_SUCCESS) {
         HENGE_LOG("#%llu: vm_remap failed for rx=%p size=%zu: %d (%s)",
                  (unsigned long long)n, rx, bytes, (int)kr, mach_error_string(kr));
+        vm_deallocate(mach_task_self(), (vm_address_t)rx, (vm_size_t)bytes);
         return region;
     }
 
@@ -798,14 +802,13 @@ static HengeDualMapping henge_ios_jit_allocate_real(size_t bytes)
                  (unsigned long long)n, (void *)rw, bytes, (int)kr,
                  mach_error_string(kr));
         vm_deallocate(mach_task_self(), rw, (vm_size_t)bytes);
+        vm_deallocate(mach_task_self(), (vm_address_t)rx, (vm_size_t)bytes);
         return region;
     }
 
     region.rw_addr = (uint8_t *)rw;
     region.rx_addr = (uint8_t *)rx;
     region.size    = bytes;
-    atomic_store(&g_jit_available, true);
-
     HENGE_LOG("#%llu: dual mapping established: rw=%p rx=%p size=%zu diff=%+lld",
              (unsigned long long)n, (void *)region.rw_addr, (void *)region.rx_addr,
              region.size, (long long)(region.rx_addr - region.rw_addr));
@@ -820,6 +823,7 @@ static HengeDualMapping henge_ios_jit_allocate_real(size_t bytes)
         return region;
     }
 
+    atomic_store(&g_jit_available, true);
     return region;
 }
 
@@ -1001,6 +1005,7 @@ HengeDualMapping henge_ios_jit_allocate(size_t bytes)
 int henge_ios_take_high_room(void **base, size_t *bytes) { (void)base, (void)bytes; return 0; }
 bool henge_ios_jit_prewarm(size_t bytes) { (void)bytes; return false; }
 bool henge_ios_jit_prewarm_self(size_t bytes) { (void)bytes; return false; }
+HengeDualMapping *henge_ios_jit_get_mapping(void) { return NULL; }
 bool henge_ios_jit_reserve_bottom(size_t end) { (void)end; return true; }
 void henge_ios_jit_release(HengeDualMapping *m) { (void)m; }
 void henge_ios_jit_detach(void) {}

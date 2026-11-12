@@ -135,13 +135,13 @@ int main(void) {
     expect("EPD1 disables TTBR1 walks", &cpu, 0xffffffc012343210, HV_ACC_READ, 1, 0, HV_FSC_TRANSLATION(0));
     cpu.tcr_el1 &= ~(1ull << 23);
 
-    /* The TLB only takes 16 KB or larger mappings. */
+    /* Neither TLB configuration may cache a non-RAM mapping. */
     uint64_t pa;
     hv_tlb_flush(&cpu);
     hv_mmu_access(&cpu, 0x100004000, HV_ACC_READ, 1, &pa);
     checks++;
     /* 0x40008000 is not RAM here, so nothing may be filled */
-    if ((*hv_tlb_ent(&cpu, (0x100004000 >> 14) & (HV_TLB_SIZE - 1), 1)).read_tag != HV_TLB_INVALID) {
+    if ((*hv_tlb_ent(&cpu, (0x100004000 >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), 1)).read_tag != HV_TLB_INVALID) {
         printf("  FAIL TLB filled for non-RAM\n");
         failures++;
     }
@@ -160,8 +160,8 @@ int main(void) {
     hv_tlb_flush(&cpu);
     hv_mmu_access(&cpu, 0x12345678, HV_ACC_READ, 1, &pa);
     checks++;
-    if ((*hv_tlb_ent(&cpu, (0x12345678 >> 14) & (HV_TLB_SIZE - 1), 1)).read_tag != HV_TLB_INVALID) {
-        printf("  FAIL a 4K mapping went into the 16K TLB\n");
+    if ((*hv_tlb_ent(&cpu, (0x12345678 >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), 1)).read_tag != HV_TLB_INVALID) {
+        printf("  FAIL a non-RAM 4K mapping went into the TLB\n");
         failures++;
     }
 
@@ -184,7 +184,7 @@ int main(void) {
             int table = (bases[b] >> 55) & 1 ? 1 : 0;
             for (int k = 0; k < 8; k++) {
                 uint64_t va = bases[b] + ((uint64_t)k << 14);
-                HvTlbEntry *t = &(*hv_tlb_ent(&cpu, (va >> 14) & (HV_TLB_SIZE - 1), table));
+                HvTlbEntry *t = &(*hv_tlb_ent(&cpu, (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), table));
                 t->read_tag = va - HV_TLB_ADJ;
                 t->addend = 0;
             }
@@ -193,7 +193,7 @@ int main(void) {
             hv_sysreg_sys(&cpu, 0xd5088221u, 0); /* tlbi rvae1is, x1 */
             for (int k = 0; k < 8; k++) {
                 uint64_t va = bases[b] + ((uint64_t)k << 14);
-                int dropped = (*hv_tlb_ent(&cpu, (va >> 14) & (HV_TLB_SIZE - 1), table)).read_tag == HV_TLB_INVALID;
+                int dropped = (*hv_tlb_ent(&cpu, (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), table)).read_tag == HV_TLB_INVALID;
                 checks++;
                 if (dropped != (k < 6)) {
                     printf("  FAIL range TLBI, base %llx page %d: %s\n", (unsigned long long)bases[b], k,
@@ -214,12 +214,12 @@ int main(void) {
             const int32_t ks[6] = {0, 1, (int32_t)ranges[r].pages / 2, (int32_t)ranges[r].pages - 1, (int32_t)ranges[r].pages, (int32_t)ranges[r].pages + 300};
             for (int k = 0; k < 6; k++) {
                 uint64_t va = base + ((uint64_t)ks[k] << 14);
-                HvTlbEntry *t = hv_tlb_ent(&cpu, (va >> 14) & (HV_TLB_SIZE - 1), 1);
+                HvTlbEntry *t = hv_tlb_ent(&cpu, (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), 1);
                 t->read_tag = va - HV_TLB_ADJ;
                 t->addend = 0;
             }
             uint64_t uva = 0x100000000ull + ((uint64_t)7000 << 14); /* a process's page, in a slot outside the range's */
-            HvTlbEntry *u = hv_tlb_ent(&cpu, (uva >> 14) & (HV_TLB_SIZE - 1), 0);
+            HvTlbEntry *u = hv_tlb_ent(&cpu, (uva >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), 0);
             u->read_tag = uva - HV_TLB_ADJ;
             u->addend = 0;
             cpu.el = 1;
@@ -227,7 +227,7 @@ int main(void) {
             hv_sysreg_sys(&cpu, 0xd5088221u, 0); /* tlbi rvae1is, x1 */
             for (int k = 0; k < 6; k++) {
                 uint64_t va = base + ((uint64_t)ks[k] << 14);
-                int dropped = hv_tlb_ent(&cpu, (va >> 14) & (HV_TLB_SIZE - 1), 1)->read_tag == HV_TLB_INVALID;
+                int dropped = hv_tlb_ent(&cpu, (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), 1)->read_tag == HV_TLB_INVALID;
                 checks++;
                 if (dropped != (ks[k] < (int32_t)ranges[r].pages)) {
                     printf("  FAIL big kernel range %u pages, page %d: %s\n", ranges[r].pages, ks[k], dropped ? "dropped" : "kept");
@@ -235,7 +235,7 @@ int main(void) {
                 }
             }
             checks++;
-            if (hv_tlb_ent(&cpu, (uva >> 14) & (HV_TLB_SIZE - 1), 0)->read_tag == HV_TLB_INVALID) {
+            if (hv_tlb_ent(&cpu, (uva >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), 0)->read_tag == HV_TLB_INVALID) {
                 printf("  FAIL big kernel range %u pages dropped a process's entry\n", ranges[r].pages);
                 failures++;
             }
@@ -250,7 +250,7 @@ int main(void) {
         cpu.ttbr0_el1 = 7ull << 48;
         hv_ijc_switch(&cpu);
         uint64_t salt = cpu.ijc_salt[0];
-        static const uint64_t vas[3] = {0x100004010ull, 0x100007ffcull, 0x100008010ull}; /* page P twice, then page Q */
+        static const uint64_t vas[3] = {0x100004010ull, 0x100004000ull + (1ull << HV_TLB_PAGE_BITS) - 4, 0x100008010ull}; /* page P twice, then page Q */
         uint64_t *ents[3];
         static HvBlock fake[3];
         for (int i = 0; i < 3; i++) {
@@ -333,7 +333,7 @@ int main(void) {
             }
             r->code_pages[10] = 1;
             r->ijc_va[10] = cases[c].note;
-            hv_invalidate_code(&m, r->pa + (10ull << 14));
+            hv_invalidate_code(&m, r->pa + (10ull << HV_TLB_PAGE_BITS));
             for (int i = 0; i < 2; i++) {
                 int kept = ents[i][0] == (fb[i].va ^ salt) && cpu.ijc_salt[0] == salt;
                 checks++;
@@ -358,13 +358,13 @@ int main(void) {
             uint32_t idx = base + i, pg = pages[i];
             m.slots[idx] = 0x1000 + i;
             m.slot_site[idx] = NULL;
-            m.slot_xpa[idx] = (r->pa + ((uint64_t)pg << 14)) | 1;
+            m.slot_xpa[idx] = (r->pa + ((uint64_t)pg << HV_TLB_PAGE_BITS)) | 1;
             m.slot_xnext[idx] = r->xhead[pg];
             r->xhead[pg] = idx + 1;
             m.nxchained++;
         }
         r->code_pages[10] = 1;
-        hv_invalidate_code(&m, r->pa + (10ull << 14) + 0x40);
+        hv_invalidate_code(&m, r->pa + (10ull << HV_TLB_PAGE_BITS) + 0x40);
         for (uint32_t i = 0; i < 4; i++) {
             int gone = m.slots[base + i] == 0 && m.slot_xpa[base + i] == 0;
             checks++;
@@ -375,7 +375,7 @@ int main(void) {
         if (r->xhead[11] != base + 2) printf("  FAIL the other page's list changed\n"), failures++;
         if (m.nxchained != n0 + 1) printf("  FAIL chained count %u, want %u\n", m.nxchained, n0 + 1), failures++;
         r->code_pages[11] = 1;
-        hv_invalidate_code(&m, r->pa + (11ull << 14));
+        hv_invalidate_code(&m, r->pa + (11ull << HV_TLB_PAGE_BITS));
         checks++;
         if (m.slots[base + 1] || r->xhead[11] || m.nxchained != n0) printf("  FAIL the second page's exit stayed chained\n"), failures++;
     }
@@ -396,7 +396,7 @@ int main(void) {
             hv_tlb_flush(&cpu2);
             for (int k = 0; k < 6; k++) {
                 uint64_t va = base + ((uint64_t)ks[k] << 14);
-                HvTlbEntry *t = hv_tlb_ent(&cpu2, (va >> 14) & (HV_TLB_SIZE - 1), 0);
+                HvTlbEntry *t = hv_tlb_ent(&cpu2, (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), 0);
                 t->read_tag = va - HV_TLB_ADJ;
                 t->addend = 0;
             }
@@ -419,7 +419,7 @@ int main(void) {
             if (!knob) hv_cpu_process_requests(&cpu2); /* what it does when it next runs */
             for (int k = 0; k < 6; k++) {
                 uint64_t va = base + ((uint64_t)ks[k] << 14);
-                int dropped = hv_tlb_ent(&cpu2, (va >> 14) & (HV_TLB_SIZE - 1), 0)->read_tag == HV_TLB_INVALID;
+                int dropped = hv_tlb_ent(&cpu2, (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), 0)->read_tag == HV_TLB_INVALID;
                 checks++;
                 if (dropped != (ks[k] < 64)) {
                     printf("  FAIL remote range (knob %d), page %d: %s\n", knob, ks[k], dropped ? "dropped" : "kept");
@@ -449,7 +449,7 @@ int main(void) {
         static HvCpu cpu3;
         hv_cpu_reset_index(&cpu3, &m, 1);
         HvPerCpu *p3 = cpu3.pc_state;
-        const uint64_t P = 0x100004000ull, Q = 0x100008000ull;
+        const uint64_t P = 0x100004000ull, Q = P + (1ull << HV_TLB_PAGE_BITS);
         struct { const char *what; uint64_t walked; int knob, range, want; } cases[] = {
             {"a walk of another page", Q, 1, 0, 1},       {"a walk of the page", P + 0x10, 1, 0, 0},
             {"a process switch", ~0ull, 1, 0, 0},         {"a walk of another page, knob off", Q, 0, 0, 0},
@@ -460,7 +460,7 @@ int main(void) {
         for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
             hv_knob[HV_K_WALKLOG] = cases[c].knob;
             uint32_t seq = __atomic_load_n(&p3->walk_seq, __ATOMIC_SEQ_CST) & ~1u;
-            uint64_t pg = cases[c].walked == ~0ull ? ~0ull : cases[c].walked & 0x00ffffffffffc000ull;
+            uint64_t pg = cases[c].walked == ~0ull ? ~0ull : cases[c].walked & 0x00ffffffffffffffull & ~((1ull << HV_TLB_PAGE_BITS) - 1);
             p3->walk_page[(seq >> 1) & 7] = pg;
             __atomic_store_n(&p3->walk_seq, seq + 1, __ATOMIC_SEQ_CST);
             int r = cases[c].range ? hv_tlbi_drop_remote_range(&cpu3, P, 2, 5) : hv_tlbi_drop_remote_va(&cpu3, P, 5);

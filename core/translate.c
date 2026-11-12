@@ -5,6 +5,7 @@
 
 #include "classify.h"
 #include "memop.h"
+#include "rosetta.h"
 #include "mmu.h"
 #include "operands.h"
 
@@ -92,7 +93,7 @@ typedef struct {
     uint32_t pool_at;    /* where the literal pool is, in the cold part */
     uint32_t flags;
     int slow_mem;
-    uint64_t page;       /* guest VA of the 16 KB page the block is in */
+    uint64_t page;       /* guest VA of the software page the block is in */
     int no_ijc;          /* indirect branches always go to the dispatcher (breakpoints, tests' stop PC) */
     HvMachine *m;
     uint64_t cur_pc;     /* guest PC of the instruction being translated (or whose out-of-line exit is) */
@@ -339,7 +340,7 @@ static void put_exit(Emit *e, uint64_t target) {
     put(e, BR_X(1));
 }
 
-/* A direct branch to target. Within the block's own 16 KB page the exit is
+/* A direct branch to target. Within the block's own software page the exit is
    chainable: it jumps to the block whose entry the dispatcher stored in this
    exit's slot (plain data, so chaining never rewrites code), as long as nobody
    has asked the CPU to leave. The hit path touches only the free scratch
@@ -577,7 +578,7 @@ static uint32_t slot_of(int reg) {
 
 /* ---- instruction groups ---- */
 
-static void translate_copy(Emit *e, uint32_t insn) {
+static void translate_copy_inner(Emit *e, uint32_t insn) {
     uint32_t fields = hv_gpr_fields(insn);
     if (!fields) {
         put(e, insn);
@@ -638,6 +639,82 @@ static void translate_copy(Emit *e, uint32_t insn) {
         put(e, STR_X(scratch_of[k], 28, slot_of(stolen[0])));
     }
     unspill(e, regs, n);
+}
+
+static void ap_load(Emit *e, int dst, int src, int sp) {
+    if (src == 31) put(e, sp ? (0x910003e0u | dst) : MOV_X(dst, 31));
+    else put(e, is_stolen(src) ? LDR_X(dst, 28, slot_of(src)) : MOV_X(dst, src));
+}
+
+/* Common arithmetic stays entirely in generated code. Only x6/x7/x15,
+   which are translator-owned, are scratch; every operation after the
+   guest arithmetic preserves its native NZCV result. */
+static void ap_integer_inline(Emit *e, uint32_t i) {
+    unsigned rn = i >> 5 & 31, rm = i >> 16 & 31, rd = i & 31;
+    int imm = (i & 0x1f000000u) == 0x11000000u;
+    int logical_imm = (i & 0x7f800000u) == 0x72000000u;
+    int logical = logical_imm || (i & 0x7f000000u) == 0x6a000000u;
+    int extended = !logical && (i & 0x1fe00000u) == 0x0b200000u;
+    int carry = (i & 0x3fe0fc00u) == 0x3a000000u;
+    ap_load(e, 6, rn, imm || extended);
+    uint32_t out = (i & ~(31u << 5 | 31u)) | 6u << 5 | 15u;
+    if (!imm && !logical_imm) {
+        ap_load(e, 7, rm, 0);
+        out = (out & ~(31u << 16)) | 7u << 16;
+    }
+    put(e, out);
+    if (rd != 31) put(e, is_stolen(rd) ? STR_X(15, 28, slot_of(rd)) : MOV_X(rd, 15));
+    if (logical) {
+        put(e, MOV_X(6, 31));
+    } else {
+        if (imm) put_lit(e, 7, (uint64_t)(i >> 10 & 4095) << ((i >> 22 & 1) ? 12 : 0));
+        else if (extended) {
+            unsigned shift = i >> 10 & 7;
+            if (shift) put(e, UBFM_X(7, 7, 64 - shift, 63 - shift));
+        } else if (!carry) {
+            /* Recreate the shifted operand without changing flags. */
+            put(e, (i & 0x80c0fc00u) | 0x0b000000u | 7u << 16 | 31u << 5 | 7u);
+        }
+        put(e, 0xca0700c6u); /* eor x6, x6, x7 */
+        put(e, 0xca0f00c6u); /* eor x6, x6, x15 */
+        put(e, UBFM_X(6, 6, 4, 4));
+        put(e, UBFM_X(6, 6, 37, 36)); /* AF -> bit 27 */
+    }
+    put(e, 0xca4f11e7u); /* eor x7, x15, x15, lsr #4 */
+    put(e, 0xca4708e7u); /* eor x7, x7, x7, lsr #2 */
+    put(e, 0xca4704e7u); /* eor x7, x7, x7, lsr #1 */
+    put(e, 0xd24000e7u); /* eor x7, x7, #1: even parity */
+    put(e, UBFM_X(7, 7, 0, 0));
+    put(e, 0xaa0768c6u); /* orr x6, x6, x7, lsl #26 */
+    put(e, STR_X(6, 28, HV_CPU_APFLAGS));
+    e->u_live = 0;
+}
+
+/* The mode check does not change NZCV. ARM code takes the copied path;
+   only an EL0 thread with ACTLR.APFLG enabled pays for software flags. */
+static void translate_copy(Emit *e, uint32_t insn) {
+    if (e->m->rosetta && !(e->flags & HV_BLOCK_EL1) && hv_rosetta_integer_flags(insn)) {
+        put(e, LDR_X(15, 28, HV_CPU_ACTLR));
+        uint32_t native = e->n;
+        put(e, 0x3620000fu); /* tbz x15, #4, native */
+        if (e->m->rosetta == 2 || (insn & 0x3fe00410u) == 0x3a400000u)
+            put_helper(e, e->cur_pc, insn, HV_OP_APFLAGS);
+        else ap_integer_inline(e, insn);
+        uint32_t done = e->n;
+        put(e, 0x14000000u);
+        patch_branch(&e->w[native], (int64_t)e->n - native);
+        translate_copy_inner(e, insn);
+        patch_branch(&e->w[done], (int64_t)e->n - done);
+        return;
+    }
+    translate_copy_inner(e, insn);
+    if (e->m->rosetta && !(e->flags & HV_BLOCK_EL1) && hv_rosetta_fp_compare(insn)) {
+        put(e, LDR_X(15, 28, HV_CPU_ACTLR));
+        uint32_t skip = e->n;
+        put(e, 0x3620000fu);
+        put_helper(e, e->cur_pc, insn, HV_OP_APFCMP);
+        patch_branch(&e->w[skip], (int64_t)e->n - skip);
+    }
 }
 
 /* Write a translation-time constant to guest register rd (31 is XZR here). */
@@ -947,7 +1024,7 @@ static void translate_excl(Emit *e, uint32_t insn, uint64_t pc) {
     patch_branch(&e->w[to_done], (int64_t)e->n - to_done);
 }
 
-static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+static void translate_mem_inner(Emit *e, uint32_t insn, uint64_t pc) {
     HvMemOp op;
     if (hv_mem_decode(insn, &op) != 0) {
         put_helper(e, pc, insn, HV_OP_UNDEF);
@@ -1072,11 +1149,11 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     put(e, LDR_X(U, T, tlb + (op.store ? 8 : 0)));
     put(e, SUB_X(U, addr, U));
     if (op.align && op.bytes > 1) {
-        /* and U, U, #~(0x3fff & ~(bytes-1)) after taking the adjustment back off:
+        /* and U, U, #~(page_mask & ~(bytes-1)) after taking the adjustment back off:
            zero only if same page and aligned */
         uint32_t k = __builtin_ctz(op.bytes);
         put(e, 0xd1000000u | HV_TLB_ADJ << 10 | U << 5 | U); /* sub U, U, #ADJ */
-        put(e, 0x92400000u | 50u << 16 | (49u + k) << 10 | U << 5 | U);
+        put(e, 0x92400000u | (64u - HV_TLB_PAGE_BITS) << 16 | (63u - HV_TLB_PAGE_BITS + k) << 10 | U << 5 | U);
     } else {
         if (op.bytes > HV_TLB_ADJ + 1) put_add_imm(e, U, U, op.bytes - 1 - HV_TLB_ADJ);
         put(e, UBFM_X(U, U, HV_TLB_PAGE_BITS, 63));
@@ -1199,6 +1276,24 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     if (role && U == 15 && !rt2_stolen && !(rt_stolen && rt == U) && op.mode == HV_ADDR_OFFSET) e->u_live = grp->slot + 1;
 }
 
+/* TSO preserves Load->Load, Load->Store and Store->Store, but permits
+   Store->Load reordering. An ISHLD after each load and an ISHST before each
+   store implement those edges on our Armv8.5 hosts. RMWs keep full barriers
+   on both sides. Mode 2 retains the original full-fence reference path.
+   Keep these outside the complete operation: slow-path joins and grouped
+   accesses must cross exactly the same ordering boundary as fast accesses. */
+static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+    HvMemOp op;
+    int tso = e->m->software_tso;
+    int decoded = tso && hv_mem_decode(insn, &op) == 0;
+    int full = tso && (tso == 2 || !decoded || (op.load && op.store));
+    if (full) put(e, 0xd5033bbfu); /* dmb ish */
+    else if (decoded && op.store) put(e, 0xd5033abfu); /* dmb ishst */
+    translate_mem_inner(e, insn, pc);
+    if (full) put(e, 0xd5033bbfu);
+    else if (decoded && op.load) put(e, 0xd50339bfu); /* dmb ishld */
+}
+
 /* DC ZVA: zero the 64-byte block holding Xt, on the host's own copy when the
    TLB maps it writable (xnu's bzero does this a million times a second).
    The host's DC ZVA block is 64 bytes too (checked at translation time);
@@ -1254,6 +1349,7 @@ static void translate_ic_ivau(Emit *e, uint32_t insn, uint64_t pc) {
 }
 
 static void translate_dc_zva(Emit *e, uint32_t insn, uint64_t pc) {
+    if (e->m->software_tso) put(e, e->m->software_tso == 2 ? 0xd5033bbfu : 0xd5033abfu);
     int rt = insn & 0x1f;
     uint32_t used = 1u << rt;
     uint8_t s[3];
@@ -1276,6 +1372,7 @@ static void translate_dc_zva(Emit *e, uint32_t insn, uint64_t pc) {
     put(e, 0xd50b7420u | A); /* dc zva, A */
     unspill(e, s, 3);
     e->ool[slow].join = e->n;
+    if (e->m->software_tso == 2) put(e, 0xd5033bbfu);
 }
 
 /* System registers that are plain storage, or host registers that already
@@ -1490,9 +1587,37 @@ static int translate_sysreg_inline(Emit *e, uint32_t insn, uint64_t pc) {
         if (!read) return 0;
         return translate_counter(e, insn, pc, reg == SR(3, 3, 14, 0, 1) || reg == SR(3, 3, 14, 0, 5));
     case SR(3, 3, 4, 2, 0): /* NZCV */
+        if (e->m->rosetta && !el1) {
+            if (e->m->rosetta == 2) return 0;
+            if (read) {
+                put(e, 0xd53b420fu); /* mrs x15, nzcv */
+                put(e, LDR_X(7, 28, HV_CPU_ACTLR));
+                uint32_t skip = e->n;
+                put(e, 0x36200007u); /* tbz x7, #4 */
+                put(e, LDR_X(6, 28, HV_CPU_APFLAGS));
+                put(e, 0xaa0601efu); /* orr x15, x15, x6 */
+                patch_branch(&e->w[skip], (int64_t)e->n - skip);
+                if (rt != 31) put(e, is_stolen(rt) ? STR_X(15, 28, slot_of(rt)) : MOV_X(rt, 15));
+            } else {
+                ap_load(e, 15, rt, 0);
+                put(e, 0xd51b420fu); /* msr nzcv, x15 */
+                put(e, STR_X(31, 28, HV_CPU_APFLAGS));
+                put(e, LDR_X(7, 28, HV_CPU_ACTLR));
+                uint32_t skip = e->n;
+                put(e, 0x36200007u);
+                put(e, UBFM_X(15, 15, 26, 27));
+                put(e, UBFM_X(15, 15, 38, 37));
+                put(e, STR_X(15, 28, HV_CPU_APFLAGS));
+                patch_branch(&e->w[skip], (int64_t)e->n - skip);
+            }
+            e->u_live = 0;
+            return 1;
+        }
         put_native_sysreg(e, insn, read);
         return 1;
     case SR(3, 3, 4, 4, 0): /* FPCR */
+        if (e->m->rosetta) return 0;
+        /* fall through */
     case SR(3, 3, 4, 4, 1): /* FPSR */
         if (!fp_ok) return 0; /* traps: leave it to the helper */
         put_native_sysreg(e, insn, read);
@@ -1686,7 +1811,9 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
             translate_ic_ivau(e, insn, pc);
             return 0;
         }
+        if (dc_zva && e->m->software_tso) put(e, e->m->software_tso == 2 ? 0xd5033bbfu : 0xd5033abfu);
         put_helper(e, pc, insn, HV_OP_SYS);
+        if (dc_zva && e->m->software_tso == 2) put(e, 0xd5033bbfu);
         /* DC and AT continue, and so does IC IVAU: invalidating code sets exit_req,
            so the block leaves at its next exit if it mattered. So do TLBIs: the
            helper leaves itself when one may cover the page this block runs from
@@ -2046,7 +2173,8 @@ static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_
     uint64_t gen = __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST);
     if (chunk.m != m || chunk.gen != gen || !chunk.hot || (size_t)(chunk.cold - chunk.hot) < (size_t)hot + cold) {
         size_t want = JIT_CHUNK_WORDS;
-        if (want > m->jit.capacity) want = m->jit.capacity;
+        size_t capacity = m->jit.limit && m->jit.limit < m->jit.capacity ? m->jit.limit : m->jit.capacity;
+        if (want > capacity) want = capacity;
         if (want < (size_t)hot + cold) want = (size_t)hot + cold;
         uint32_t *p = hv_jit_reserve(&m->jit, want);
         if (!p) {

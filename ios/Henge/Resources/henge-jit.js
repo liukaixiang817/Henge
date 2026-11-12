@@ -102,7 +102,8 @@ function JIT26NewBreakpoints(brkResponse) {
 
 // brk 0x69
 function JIT26HandleBrk0x69(brkResponse) {
-    let putX0Response = send_command(`P0=E0000069;thread:${tid};`);
+    // GDB register writes use target byte order and the full 64-bit width.
+    let putX0Response = send_command(`P0=${numberToLittleEndianHexString(0xE0000069n)};thread:${tid};`);
     log(`putX0Response = ${putX0Response}`);
 }
 

@@ -23,7 +23,8 @@ enum InstantResume {
         let commit = info["HengeBuildCommit"] as? String ?? "unstamped"
         let stamp = info["HengeBuildDate"] as? String ?? "?"
         return "Henge \(version) (\(build)) \(commit) \(stamp) mac \(mac.id.uuidString) ram \(ramMB) cpus \(cpus) "
-            + "screen \(mac.screen.width)x\(mac.screen.height) retina \(mac.isRetina)"
+            + "screen \(mac.screen.width)x\(mac.screen.height) retina \(mac.isRetina) "
+            + "engine \(henge_engine_rosetta()) revision \(String(cString: henge_engine_revision()))"
     }
 
     /// A whole saved Mac for these settings, and when it was saved.

@@ -15,6 +15,7 @@ struct SettingsView: View {
     @AppStorage(EngineTuning.wfiSpinKey) private var wfiSpin = false
     @AppStorage(EngineTuning.superblocksKey) private var superblocks = false
     @AppStorage(JITBootstrap.codeCacheKey) private var codeCacheMB = JITBootstrap.defaultCodeCacheMB
+    @AppStorage("henge.rosetta") private var intelApps = false
     @AppStorage(DeskAppearance.key) private var appearance = DeskAppearance.system
     @AppStorage(InstantResume.key) private var instantResume = false
     @AppStorage(MacAppsFeature.key) private var macApps = false
@@ -38,19 +39,43 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section("JIT") {
-                    LabeledContent("Status", value: JITBootstrap.ready ? "On" : "Off")
+                    LabeledContent("Status", value: jit.ready ? "On" : JITBootstrap.debuggedFlag ? "Code region not ready" : "Off")
                     Picker("Method", selection: $jit.method) {
                         ForEach(JITMethod.allCases) { Text($0.title).tag($0) }
                     }
                     Text(jit.method == .automatic ? jit.automaticDescription : "Henge uses \(jit.method.title).")
                         .font(.footnote).foregroundStyle(.secondary)
                     Button("Set up JIT") { jit.showSetup = true }
+                    if !jit.ready {
+                        Button(jit.busy ? "Preparing JIT…" : "Turn On JIT") { jit.enable() }
+                            .disabled(jit.busy)
+                        if let message = jit.error ?? JITBootstrap.lastFailure {
+                            Text(message).font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }
                     Toggle("Turn on JIT when Henge opens", isOn: $jitAtLaunch)
                     if jitAtLaunch {
                         Text("Henge connects LocalDevVPN first when it is off, and comes back.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
-                    LabeledContent("Code region", value: "\(JITBootstrap.jitBytes >> 20) MB, claimed once per launch")
+                    LabeledContent("Code region", value: jit.ready
+                        ? "\(JITBootstrap.jitBytes >> 20) MB, ready"
+                        : "Not allocated (\(JITBootstrap.jitBytes >> 20) MB)")
+                }
+                .listRowBackground(Desk.card)
+                Section("Applications") {
+                    Toggle("Rosetta (Intel apps)", isOn: $intelApps)
+                        .disabled(henge_rosetta_available() == 0 && !intelApps)
+                        .onChange(of: intelApps) { _, enabled in henge_vm_set_rosetta(enabled ? 1 : 0) }
+                    LabeledContent("Current engine", value: henge_engine_rosetta() != 0 ? "Rosetta" : "Mainline")
+                    if intelApps != (henge_engine_rosetta() != 0) {
+                        Text("Quit Henge and reopen it to apply this change.")
+                            .font(.footnote).foregroundStyle(.orange)
+                    }
+                    Text(henge_rosetta_available() != 0
+                         ? "Experimental support. Intel apps run very slowly. Off uses the mainline engine; on uses the Rosetta engine. Quit and reopen Henge after changing this setting. macOS may ask to install Rosetta."
+                         : "Rosetta is not available on this device yet. Leave it off to use the mainline engine.")
+                        .font(.footnote).foregroundStyle(.secondary)
                 }
                 .listRowBackground(Desk.card)
                 Section("Memory") {

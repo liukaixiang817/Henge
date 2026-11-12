@@ -37,6 +37,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: Henge
+          # The selectable engines export the revision in ios/engine-mainline.txt.
+          fetch-depth: 0
 
       # fetch_deps.sh copies prebuilt pieces out of a BUILT Husk checkout:
       # StikJIT.xcframework (vendored in Husk's repo, comes with checkout),
@@ -66,11 +68,29 @@ jobs:
             rustup target add aarch64-apple-ios
           }
 
-      # build_ios.sh builds from third_party/build/<name>; the sources are
-      # fetched by fetch_sources.sh, which Husk's own ci_build.sh runs first.
-      - name: Fetch Husk's third-party sources
+      # Match the three stages below. A restored unpack stamp means the source
+      # is already present; QEMU, pixman and libucontext are not used by Henge.
+      - name: Fetch the third-party sources Henge needs
         working-directory: Husk
-        run: bash scripts/fetch_sources.sh
+        run: |
+          set -euo pipefail
+          source scripts/sources.sh
+          mkdir -p third_party/sources third_party/build
+          for url in "$FFI_SRC" "$GLIB_SRC" "$SLIRP_SRC"; do
+            archive="third_party/sources/${url##*/}"
+            stamp="third_party/build/.unpacked-${url##*/}"
+            if [ -f "$stamp" ]; then
+              echo "[skip] ${url##*/} is already unpacked"
+              continue
+            fi
+            if [ ! -s "$archive" ]; then
+              curl --fail --location --retry 3 --retry-all-errors --retry-delay 5 \
+                --connect-timeout 30 --output "$archive.part" "$url"
+              mv "$archive.part" "$archive"
+            fi
+            tar -xf "$archive" -C third_party/build
+            touch "$stamp"
+          done
 
       # Henge only needs these three sysroot pieces: libffi (a glib dep),
       # glib (whose meson subprojects also produce libpcre2-8 and libintl),

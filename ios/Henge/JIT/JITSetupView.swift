@@ -274,7 +274,7 @@ struct JITSetupFlow: View {
 
     // MARK: Enable
 
-    private var attached: Bool { jit.attachGeneration > 0 || JITBootstrap.debuggedFlag }
+    private var attached: Bool { jit.ready }
 
     private var enable: some View {
         page(symbol: "bolt.badge.checkmark", title: "Turn on JIT",

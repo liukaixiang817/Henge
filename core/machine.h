@@ -13,7 +13,7 @@ typedef struct HvRam {
     uint64_t pa, size;
     uint8_t *host;
     int readonly;
-    uint8_t *code_pages; /* one byte per 16 KB page: a translated block came from here (2^pages_log2 of them) */
+    uint8_t *code_pages; /* one byte per software page: a translated block came from here (2^pages_log2 of them) */
     uint32_t pages_log2;
     uint32_t *page_gen;  /* per page: bumped to invalidate the blocks translated from it */
     /* Per page and CPU: up to three TLB entries (slot << 2 | table, plus 1;
@@ -88,7 +88,7 @@ typedef struct HvStats {
     uint64_t tlb_miss_kind[4]; /* TLB misses: EL0 empty, EL0 other page there, EL1 empty, EL1 other page there */
     uint64_t stash_stale;     /* process switches that found the stash dropped by a TLBI meanwhile */
     uint64_t slow_why[6];
-    uint64_t small_pages;     /* of the TLB misses above: the guest maps the page with a granule under 16 KB (4 KB), which the TLB cannot hold */
+    uint64_t small_pages;     /* TLB misses on guest mappings smaller than the software page size */
     struct { uint64_t mb, n; } small_at[8]; /* where (VA >> 20, bit 0 = EL1) the first 8 such regions were */     /* slow accesses by cause: MMIO, code-page write, page end, TLB miss, other, TLB entry there but mismatched */
     uint64_t slow_kind[12];   /* hv_mem_emulate calls by HV_MEM_* kind */
     uint64_t light_kind[4];
@@ -247,6 +247,10 @@ typedef struct HvMachine {
     int trace;           /* print every block entered */
     int log;             /* 1: unknown sysregs, undefined instructions, unmapped accesses; 2: also every exception */
     int slow_mem;        /* tests: send every load and store through hv_mem_emulate */
+    /* Fixed before translating: 0 off, 1 software TSO, 2 full-barrier reference.
+       Guest ordering is implemented without changing privileged host modes. */
+    int software_tso;
+    int rosetta;         /* 0 off, 1 inline AP flags, 2 C reference; requires host AFP */
     uint64_t switch_flush_pc[4]; /* HV_SWITCH_FLUSH=3: PCs of the TLBI VMALLE1s seen within 20 us of a TTBR0 change (xnu's pmap switch) */
     uint64_t stat_slow_mem; /* hv_mem_emulate calls */
     uint64_t access_pc;  /* guest PC of the load/store being emulated, for logs */

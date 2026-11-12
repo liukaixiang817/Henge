@@ -8,6 +8,7 @@
 #include "machine.h"
 #include "dispatch.h"
 #include "mmu.h"
+#include "rosetta.h"
 
 /* Only EL0 and EL1 exist for the guest; HengeVM plays EL2 (PSCI over HVC, as
    QEMU's vmapple machine sets up) and there is no EL3. */
@@ -46,6 +47,8 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
     if (type == HV_EXC_SYNC) cpu->m->stats.exceptions++;
     else cpu->m->stats.interrupts++;
     uint64_t spsr = hv_pstate_get(cpu);
+    cpu->aspsr_el1 = (cpu->apflags >> 25) & 6;
+    cpu->apflags = 0;
     {
         HvStats *st = &cpu->m->stats;
         uint32_t k = st->nelchg++ & 15;
@@ -70,6 +73,7 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
     cpu->excl_addr = ~0ull;
     cpu->pc = (cpu->vbar_el1 & ~0x7ffull) + offset + (uint64_t)type * 0x80;
     cpu->exit_reason = HV_EXIT_EXCEPTION;
+    hv_rosetta_fp_apply(cpu);
 }
 
 void hv_raise_sync(HvCpu *cpu, uint32_t ec, uint32_t iss, uint64_t far, uint64_t pc) {
@@ -119,6 +123,8 @@ void hv_eret(HvCpu *cpu) {
     }
     cpu->pc = cpu->elr_el1;
     hv_pstate_set(cpu, cpu->spsr_el1);
+    cpu->apflags = (cpu->aspsr_el1 & 6) << 25;
+    hv_rosetta_fp_apply(cpu);
     cpu->excl_addr = ~0ull;
 }
 

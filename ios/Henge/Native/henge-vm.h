@@ -9,6 +9,14 @@
    (henge_ios_jit_prewarm), and starts it. 0, or -1 with a reason in err. */
 int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
                   int cpus, char *err, size_t errlen);
+/* Select one engine at app launch. Only that framework can load in this process.
+   Frameworks is the app's privateFrameworksPath; it is never a downloaded path. */
+void henge_engine_configure(int rosetta, const char *frameworks);
+int henge_engine_rosetta(void);
+const char *henge_engine_revision(void);
+/* Changing the preference requires reopening Henge before boot/install. */
+int henge_rosetta_available(void);
+void henge_vm_set_rosetta(int enabled);
 /* Installs macOS from an IPSW onto a new machine (blank disk and auxiliary
    storage): boots the ROM in DFU mode and runs the restore over its USB port,
    as Virtualization.framework's installer does. workdir is scratch space.

@@ -14,6 +14,7 @@
 #include "mmu.h"
 #include "sysreg.h"
 #include "translate.h"
+#include "rosetta.h"
 
 void hv_flush_blocks(HvMachine *m) {
     /* Every other CPU is parked (stop_the_world): the one moment the TLB layout can change. */
@@ -40,7 +41,10 @@ void hv_flush_blocks(HvMachine *m) {
     m->nxchained = 0;
     for (int i = 0; i < m->nram; i++) memset(m->ram[i].xhead, 0, m->ram[i].npages * sizeof *m->ram[i].xhead); /* slots restart from 0 */
     hv_jit_reset(&m->jit);
-    m->jit.limit = hv_knob[HV_K_JITCAP] > 0 ? ((size_t)hv_knob[HV_K_JITCAP] << 20) / sizeof(uint32_t) : 0; /* MB of it to use (testing) */
+    /* The MB knob may reset its own limit; retain the sub-MB capacity used by
+       the small-cache regression when no knob overrides it. */
+    if (hv_knob[HV_K_JITCAP] > 0 || m->jit.limit >= (1u << 20) / sizeof(uint32_t))
+        m->jit.limit = hv_knob[HV_K_JITCAP] > 0 ? ((size_t)hv_knob[HV_K_JITCAP] << 20) / sizeof(uint32_t) : 0;
     /* HV_JIT_POISON: nothing old is left to run, so a stale pointer faults where it is used. */
     static int poison = -1;
     if (poison < 0) poison = getenv("HV_JIT_POISON") != NULL;
@@ -314,11 +318,12 @@ static int tlbi_may_hit(HvCpu *cpu, uint32_t insn, uint64_t pc) {
     uint32_t op1 = (insn >> 16) & 7, crm = (insn >> 8) & 0xf, op2 = (insn >> 5) & 7;
     int rt = insn & 0x1f;
     uint64_t xt = rt == 31 ? 0 : cpu->x[rt];
-    uint64_t page = pc & 0x00ffffffffffc000ull;
+    uint64_t page = pc & 0x00ffffffffffffffull & ~((1ull << HV_TLB_PAGE_BITS) - 1);
     if (op1 != 0) return 1;
     if ((crm == 1 || crm == 3 || crm == 7) && (op2 & 1)) { /* one page */
         uint64_t va = (uint64_t)((int64_t)((xt & 0xfffffffffffull) << 20) >> 8);
-        return (va & 0x00ffffffffffc000ull) == page;
+        uint64_t mask = 0x00ffffffffffffffull & ~((1ull << hv_tlbi_page_bits(cpu, va)) - 1);
+        return (va & mask) == (pc & mask);
     }
     if ((crm == 2 || crm == 5 || crm == 6) && (op2 & 1)) { /* a range */
         uint32_t tg = (xt >> 46) & 3;
@@ -360,6 +365,11 @@ static uint32_t helper(HvCpu *cpu, const HvHelperInfo *info_in) {
     if (cpu->m->stats_interval && (info->op == HV_OP_MRS || info->op == HV_OP_MSR || info->op == HV_OP_SYS))
         reg_hist[(info->insn >> 5) & 0xffff] += info->op == HV_OP_MRS ? 1 : 1ull << 32;
     switch (info->op) {
+    case HV_OP_APFLAGS:
+        return hv_rosetta_alu(cpu, info->insn, info->pc);
+    case HV_OP_APFCMP:
+        cpu->apflags = (cpu->nzcv >> 28 & 1) << 26;
+        return 0;
     case HV_OP_MEM:
         cpu->m->stat_slow_mem++;
         if (cpu->m->stats_interval) { /* --stats: which kinds of access take the slow path */
@@ -724,7 +734,7 @@ static void print_stats(HvCpu *cpu, int force) {
         fprintf(stderr, "  slow mem causes K/s: mmio %.0f code-page write %.0f page end %.0f tlb miss %.0f other %.0f entry-but-tag %.0f\n",
                 RATE(slow_why[0]) / 1e3, RATE(slow_why[1]) / 1e3, RATE(slow_why[2]) / 1e3, RATE(slow_why[3]) / 1e3,
                 RATE(slow_why[4]) / 1e3, RATE(slow_why[5]) / 1e3);
-        fprintf(stderr, "  slow mem on pages mapped under 16 KB: %.0fK/s; at (MB, el)", RATE(small_pages) / 1e3);
+        fprintf(stderr, "  slow mem on pages mapped under %u KB: %.0fK/s; at (MB, el)", (1u << HV_TLB_PAGE_BITS) / 1024, RATE(small_pages) / 1e3);
         for (int i = 0; i < 8 && s->small_at[i].mb; i++)
             fprintf(stderr, " %llx/%d x%llu", (unsigned long long)(s->small_at[i].mb >> 1), (int)(s->small_at[i].mb & 1), (unsigned long long)s->small_at[i].n);
         fprintf(stderr, "\n");
@@ -766,7 +776,7 @@ static void print_stats(HvCpu *cpu, int force) {
 
 /* Fill the slot of the chainable exit a block just left through, so it jumps
    straight to b next time. Chains never need undoing: both blocks are in the
-   same 16 KB page, so when that page's code is invalidated the stale blocks are
+   same software page, so when that page's code is invalidated the stale blocks are
    only reachable from each other, and the exit_req check before every chained
    jump gets a block that just wrote its own page back to the dispatcher. */
 static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
@@ -891,6 +901,7 @@ static void stop_the_world(HvCpu *cpu) {
 int hv_run(HvCpu *cpu) {
     if (cpu->pc_state) cpu->pc_state->thread = mach_thread_self();
     hv_big_lock(cpu->m);
+    hv_rosetta_fp_apply(cpu);
     hv_fp_enter(cpu);
     int r = run(cpu, 0);
     hv_fp_leave(cpu);
@@ -900,6 +911,7 @@ int hv_run(HvCpu *cpu) {
 
 int hv_run_one(HvCpu *cpu) {
     hv_big_lock(cpu->m);
+    hv_rosetta_fp_apply(cpu);
     hv_fp_enter(cpu);
     int r = run(cpu, 1);
     hv_fp_leave(cpu);
@@ -1046,7 +1058,7 @@ static int run_loop(HvCpu *cpu, int one) {
                     static uint64_t hist[4], total;
                     uint32_t before = 0;
                     uint64_t off = b->pa - b->ram->pa;
-                    if (off & 0x3fff) memcpy(&before, b->ram->host + off - 4, 4);
+                    if (off & ((1ull << HV_TLB_PAGE_BITS) - 1)) memcpy(&before, b->ram->host + off - 4, 4);
                     int k = cpu->miss_site ? 0 : before == 0xd5033fdf ? 1 : (before & 0xfff00000u) == 0xd5100000u ? 2 : 3;
                     hist[k]++;
                     if (++total % 200000 == 0)

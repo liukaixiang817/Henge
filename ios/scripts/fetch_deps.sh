@@ -6,9 +6,11 @@
 set -e
 HUSK=${HUSK:-$HOME/Documents/Coding/Husk}
 DEPS="$(cd "$(dirname "$0")/.." && pwd)/deps"
-mkdir -p "$DEPS/lib"
+mkdir -p "$DEPS/lib" "$DEPS/include"
 rm -rf "$DEPS/StikJIT.xcframework"
 ditto "$HUSK/src/app/Frameworks/StikJIT.xcframework" "$DEPS/StikJIT.xcframework"
 cp "$HUSK/build/ios-arm64/lib/libhusk_rppairing.a" "$DEPS/lib/"
 for l in libslirp libglib-2.0 libintl libpcre2-8; do cp "$HUSK/build/ios-arm64/sysroot/lib/$l.a" "$DEPS/lib/"; done
+# Both selectable engines compile against this self-contained dependency directory.
+ditto "$HUSK/build/ios-arm64/sysroot/include/slirp" "$DEPS/include/slirp"
 echo "deps in $DEPS"

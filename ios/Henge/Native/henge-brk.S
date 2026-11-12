@@ -63,6 +63,7 @@ _henge_brk_jit_detach:
 .globl _henge_brk_probe
 .p2align 2
 _henge_brk_probe:
+    mov     x0, #0              /* ignoring the trap must not look like success */
     brk     #0x69
     ret
 

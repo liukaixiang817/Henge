@@ -2,6 +2,9 @@
 
 #include <stdlib.h>
 
+DECLARE_PROGRAM(cfinv_all);
+DECLARE_PROGRAM(xaflag_all);
+DECLARE_PROGRAM(axflag_all);
 DECLARE_PROGRAM(arith);
 DECLARE_PROGRAM(loop);
 DECLARE_PROGRAM(condbr);
@@ -16,7 +19,7 @@ DECLARE_PROGRAM(pac);
 extern const char jit_programs_begin[], jit_programs_finish[];
 
 static const TestProgram programs[] = {
-    TEST_PROGRAM(arith),   TEST_PROGRAM(loop),   TEST_PROGRAM(condbr),
+    TEST_PROGRAM(cfinv_all), TEST_PROGRAM(xaflag_all), TEST_PROGRAM(axflag_all), TEST_PROGRAM(arith),   TEST_PROGRAM(loop),   TEST_PROGRAM(condbr),
     TEST_PROGRAM(csel_ops), TEST_PROGRAM(bl_sub), TEST_PROGRAM(simd_fp),
     TEST_PROGRAM(stolen),  TEST_PROGRAM(pcrel),  TEST_PROGRAM(long_block), TEST_PROGRAM(pstate_bits),
 };
@@ -74,7 +77,9 @@ int main(void) {
        in the middle of a program, chains pending and all. */
     {
         static HvMachine small;
-        if (hv_machine_init(&small, 1024) != 0) return 1;
+        /* Split mappings require at least 4 KB; retain a 1 KB logical limit. */
+        if (hv_machine_init(&small, 4096) != 0) return 1;
+        small.jit.limit = 1024 / sizeof(uint32_t);
         hv_machine_add_ram(&small, (uint64_t)(uintptr_t)jit_programs_begin, jit_programs_finish - jit_programs_begin,
                            (void *)jit_programs_begin, 1);
         hv_machine_add_ram(&small, (uint64_t)(uintptr_t)stack, 65536, stack, 0);

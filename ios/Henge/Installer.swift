@@ -110,6 +110,10 @@ final class Installer: NSObject, ObservableObject {
 
     func start(_ release: MacOSRelease, name: String, ramMB: Int, cpus: Int, keepImage: Bool) {
         guard !busy else { return }
+        guard JITBootstrap.ready else {
+            phase = .failed(JITBootstrap.lastFailure ?? "Prepare JIT using Turn On JIT in Henge before installing macOS.")
+            return
+        }
         phase = .checking
         machineName = name
         UIApplication.shared.isIdleTimerDisabled = true // the screen locking would suspend the download and the restore
@@ -218,10 +222,10 @@ final class Installer: NSObject, ObservableObject {
     // MARK: The restore
 
     private func install(_ mac: VirtualMac, ipsw: URL, cpus: Int) async throws {
-        guard JITBootstrap.ready else { throw message("Turn on JIT first: the installer runs the Mac's own restore system, which needs it.") }
-        // The restore needs 2 GB, whatever the Mac is set to use afterwards, and gets at most 4 GB: the restore system
-        // caches the ~15 GB it writes, so it fills all the memory it is given, and 10 GB of a 12 GB iPhone's RAM in use
-        // (it is outside Henge's footprint, so iOS does not stop it) stalls the whole phone two thirds of the way through.
+        guard JITBootstrap.ready else {
+            throw message(JITBootstrap.lastFailure ?? "Henge's JIT code region is not ready. Tap Turn On JIT in Henge, then try again.")
+        }
+        // Bound restore memory: its write cache can otherwise exhaust the device.
         var restoring = mac
         restoring.ramMB = min(max(mac.ramMB, 2048), 4096)
         let ram = GuestMemory.prepare(restoring)
@@ -230,6 +234,7 @@ final class Installer: NSObject, ObservableObject {
         let work = mac.directory.appendingPathComponent("restore", isDirectory: true)
         try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
         var buffer = [CChar](repeating: 0, count: 256)
+        henge_vm_set_rosetta(UserDefaults.standard.bool(forKey: "henge.rosetta") ? 1 : 0)
         let rc = henge_vm_install(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, ipsw.path, work.path, ram, Int32(cpus),
                                   &buffer, buffer.count)
         if rc != 0 { throw message(String(cString: buffer)) }

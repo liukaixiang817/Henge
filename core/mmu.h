@@ -49,7 +49,20 @@ static inline uint32_t hv_ijc_index(uint64_t tag) {
     return (uint32_t)(((tag ^ tag >> 16 ^ tag >> 46) >> 2) & ((1u << (HV_IJC_BITS - 1)) - 1)) << 1;
 }
 static inline uint32_t hv_ijc_key(uint64_t va, uint64_t salt) {
-    return (uint32_t)(((va >> 14) * 0x9e3779b97f4a7c15ull ^ (salt >> 48) * 0xc2b2ae3d27d4eb4full) >> 44);
+    return (uint32_t)(((va >> HV_TLB_PAGE_BITS) * 0x9e3779b97f4a7c15ull ^ (salt >> 48) * 0xc2b2ae3d27d4eb4full) >> 44);
+}
+/* A single-address TLBI covers the guest granule, including every software
+   fragment of a 16/64 KB mapping. TCR changes flush current and stashed TLBs. */
+static inline unsigned hv_tlbi_page_bits(const HvCpu *cpu, uint64_t va) {
+#if HENGE_ROSETTA_4K_CACHE
+    int high = (va >> 55) & 1;
+    unsigned tg = (cpu->tcr_el1 >> (high ? 30 : 14)) & 3;
+    return high ? (tg == 1 ? 14 : tg == 3 ? 16 : 12)
+                : (tg == 2 ? 14 : tg == 1 ? 16 : 12);
+#else
+    (void)cpu; (void)va;
+    return HV_TLB_PAGE_BITS;
+#endif
 }
 /* Forget one address space's cached user targets. */
 void hv_ijc_drop_asid(HvCpu *cpu, uint16_t asid);
@@ -78,7 +91,7 @@ void hv_ucode_add(HvCpu *cpu, uint64_t va); /* a user target was cached in this 
 void hv_tlb_protect_code(HvCpu *cpu, const uint8_t *host_page);
 void hv_tlb_protect_code_page(HvCpu *cpu, struct HvRam *ram, uint64_t pg); /* the same, through the page's write hints */
 
-/* Translates for a C access of `len` bytes that stays inside one 16 KB page,
+/* Translates for a C access that stays inside one software page,
    filling the TLB when the page is ordinary RAM. Returns 0 and sets *pa, or the
    fault status code. */
 uint32_t hv_mmu_access(HvCpu *cpu, uint64_t va, HvAccess acc, int el, uint64_t *pa);

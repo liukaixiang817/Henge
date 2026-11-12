@@ -15,6 +15,11 @@ if [ "$1" = mac ]; then
     SDKNAME=macosx
     CC=(xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=14.0)
     CMAKE_TARGET=(-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0)
+elif [ "$1" = simulator ]; then
+    BUILD="$ROOT/build/simulator-restore"
+    SDKNAME=iphonesimulator
+    CC=(xcrun --sdk iphonesimulator clang -target arm64-apple-ios17.0-simulator)
+    CMAKE_TARGET=(-DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0)
 else
     BUILD="$ROOT/build/ios"
     SDKNAME=iphoneos
@@ -25,6 +30,7 @@ OUT="$BUILD/restore"
 DEPS="$BUILD/deps"
 SDK="$(xcrun --sdk $SDKNAME --show-sdk-path)"
 CC+=(-isysroot "$SDK")
+CMAKE_TARGET+=(-DCMAKE_OSX_SYSROOT="$SDK")
 mkdir -p "$OUT"
 COMMON=(-O2 -w -DHAVE_CONFIG_H -I"$TP/restore_config" -I"$TP" -I"$TP/libusb-1.0" -I"$TP/curl_include"
         -I"$TP/libplist/include" -I"$TP/libimobiledevice-glue/include" -I"$TP/libusbmuxd/include"

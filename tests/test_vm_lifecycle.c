@@ -69,6 +69,12 @@ static void *read_ui(void *unused) {
         henge_vm_cpus_on();
         henge_vm_gpu_frames();
         henge_vm_balloon(-1);
+        henge_vm_touch(1, 0, 100, 100, 1);
+        henge_vm_touch(1, 1, 120, 110, 2);
+        henge_vm_touch_frame(2);
+        henge_vm_touch_button(1);
+        henge_vm_touch_button(0);
+        henge_vm_touch(1, 2, 120, 110, 3);
         henge_vm_set_display_layer(NULL);
         if (!henge_vm_boot_display(&pixels, &width, &height, &stride)) henge_vm_free_display(pixels);
         usleep(500);
@@ -172,12 +178,25 @@ int main(void) {
         /* Save again (the failed resume took the file), then resume it properly. */
         rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
         usleep(30000);
+        /* These Apple registers are architectural state too: Intel code must
+           see the same PF/AF and DAZ/FTZ controls after a fresh-machine resume. */
+        check("pause before setting Rosetta state", henge_vm_pause(error, sizeof error) == 0);
+        for (int i = 0; i < 2; i++) {
+            hv_vm_cpu(i)->apflags = (uint64_t)(i + 1) << 26;
+            hv_vm_cpu(i)->aspsr_el1 = (uint64_t)(i + 1) << 1;
+            hv_vm_cpu(i)->afpcr_el0 = (uint64_t)i + 1;
+        }
         rc |= henge_vm_suspend(snap, "test", error, sizeof error);
         c2 = *(volatile uint64_t *)hv_vm_board()->ram;
         henge_vm_stop();
         rc |= henge_vm_resume(rom, disk, aux, 1, 0, 64, 2, snap, "test", error, sizeof error);
         if (rc) fprintf(stderr, "resume: %s\n", error);
         check("resume starts the saved Mac", rc == 0 && henge_vm_state() == 1);
+        for (int i = 0; i < 2; i++) {
+            check("resume preserves Apple integer flags", hv_vm_cpu(i)->apflags == (uint64_t)(i + 1) << 26);
+            check("resume preserves exception-saved Apple flags", hv_vm_cpu(i)->aspsr_el1 == (uint64_t)(i + 1) << 1);
+            check("resume preserves Apple floating-point controls", hv_vm_cpu(i)->afpcr_el0 == (uint64_t)i + 1);
+        }
         check("the file is used once", access(snap, F_OK) != 0);
         count = (volatile uint64_t *)hv_vm_board()->ram;
         check("resumed: the counter is where it was", *count >= c2);

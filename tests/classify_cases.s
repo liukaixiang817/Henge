@@ -11,6 +11,9 @@ _hv_classify_cases:
     movz x7, #0x1234            // copy
     nop                         // copy
     bti c                       // copy
+    cfinv                       // copy (FlagM)
+    xaflag                      // copy (FlagM2)
+    axflag                      // copy (FlagM2)
     adr x0, .                   // pcrel
     adrp x1, _hv_classify_cases@PAGE // pcrel
     b .                         // branch

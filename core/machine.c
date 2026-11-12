@@ -10,6 +10,7 @@
 
 #include "mmu.h"
 #include "sysreg.h"
+#include "rosetta.h"
 
 extern void hv_exit(void);
 extern void hv_helper_entry(void);
@@ -79,6 +80,19 @@ static int init_rest(HvMachine *m) {
     /* The TLB layout (cpu.h): HV_TLBT from the environment here too, so the Mac tool and the tests can pick it. */
     hv_knob[HV_K_TLBT] = getenv("HV_TLBT") ? atoi(getenv("HV_TLBT")) : 1; /* table-major unless asked: 9-20% faster in 5 of 6 paired rounds of the mix */
     hv_tlb_tmajor = hv_knob[HV_K_TLBT] != 0;
+    m->rosetta = getenv("HV_ROSETTA") ? atoi(getenv("HV_ROSETTA")) : 0;
+    if (m->rosetta && m->rosetta != 2) m->rosetta = 1;
+    if (m->rosetta && !hv_rosetta_host_supported()) {
+        fprintf(stderr, "hengevm: Rosetta mode requires a host with FEAT_AFP\n");
+        hv_jit_region_close(&m->jit);
+        return -1;
+    }
+#if HENGE_ROSETTA_4K_CACHE
+    if (m->rosetta) fprintf(stderr, "hengevm: Rosetta 4 KB software translation cache enabled\n");
+#endif
+    const char *tso = getenv("HV_SOFTWARE_TSO");
+    m->software_tso = tso && atoi(tso) != 0 ? (atoi(tso) == 2 ? 2 : 1) : 0;
+    if (m->rosetta && !m->software_tso) m->software_tso = 1;
     /* HV_MOVIMM=1: constants built in registers instead of loaded from the pool (translate.c put_lit). Off: no
        measured gain (Mac mix 24.1 s either way, 2026-11-08); the tests pass with it on (HV_MOVIMM=1 make test). */
     hv_knob[HV_K_MOVIMM] = getenv("HV_MOVIMM") ? atoi(getenv("HV_MOVIMM")) : 0;
@@ -612,6 +626,7 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
     memset((char *)cpu + a + sizeof cpu->m, 0, b - a - sizeof cpu->m);
     memset((char *)cpu + b + sizeof cpu->pc_state, 0, sizeof *cpu - b - sizeof cpu->pc_state);
     cpu->m = m;
+    cpu->rosetta_mode = m->rosetta;
     cpu->index = index;
     cpu->cntvoff = m->cntvoff;
     cpu->pc_state = &m->percpu[index];

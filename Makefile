@@ -1,10 +1,12 @@
 # Light build: one clang call per file, no parallel jobs needed.
 CC = clang
-CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices
+ROSETTA_4K_CACHE ?= 0
+CACHE_CFLAGS = -DHENGE_ROSETTA_4K_CACHE=$(ROSETTA_4K_CACHE)
+CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices $(CACHE_CFLAGS)
 B = build
 
 CORE = $(B)/classify.o $(B)/operands.o $(B)/translate.o $(B)/dispatch.o $(B)/mmu.o $(B)/memop.o \
-       $(B)/exception.o $(B)/sysreg.o $(B)/machine.o
+       $(B)/exception.o $(B)/sysreg.o $(B)/rosetta.o $(B)/machine.o
 HOST = $(B)/jit_region.o $(B)/enter.o $(B)/disk.o
 DEV = $(B)/pvg_lite.o $(B)/pvg_metal.o $(B)/gicv3.o $(B)/timer.o $(B)/pl011.o $(B)/pl031.o $(B)/cfg.o $(B)/bdif.o $(B)/pcie.o \
       $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_net.o $(B)/virtio_input.o $(B)/virtio_snd.o $(B)/virtio_usb.o $(B)/virtio_balloon.o $(B)/xhci.o $(B)/vmapple.o $(B)/aes.o $(B)/pl061.o $(B)/metallib.o
@@ -12,7 +14,7 @@ ENGINE = $(CORE) $(HOST)
 METAL_LIBS = -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
 
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_shutdown
+        $(B)/test_mmu $(B)/test_exc $(B)/test_tso $(B)/test_devices $(B)/test_rosetta $(B)/test_shutdown $(B)/test_rosetta_4k
 
 all: $(TESTS) $(B)/hengevm $(B)/hengevm-ref $(B)/hvsparse
 
@@ -27,7 +29,7 @@ $(B)/hengevm-ref: host/hvf_ref.c host/hvf_ref.entitlements $(ENGINE) $(DEV)
 $(B)/pvg_metal.o: devices/pvg_metal.m devices/*.h core/*.h host/*.h | $(B)
 	$(CC) $(CFLAGS) -fobjc-arc -Wno-unused-parameter -Wno-deprecated-declarations -c $< -o $@
 $(B)/pvg_mac.o: devices/pvg_mac.m devices/*.h core/*.h host/*.h | $(B)
-	$(CC) -fobjc-arc -O2 -g -Wall -mmacosx-version-min=15.2 -Icore -Ihost -Idevices -c $< -o $@
+	$(CC) $(CFLAGS) -fobjc-arc -mmacosx-version-min=15.2 -c $< -o $@
 
 # User-mode NAT for the NIC: Homebrew's libslirp (brew install libslirp).
 SLIRP_CFLAGS = $(shell pkg-config --cflags slirp)
@@ -65,6 +67,17 @@ $(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/
 	    -framework Foundation -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers -framework CoreFoundation \
 	    -framework AppKit -framework QuartzCore -o $@
 
+# Experimental iOS Simulator frontend. Supply a simulator CC and simulator-built
+# SLIRP_CFLAGS/SLIRP_LIBS; the device dependencies cannot be linked here.
+$(B)/simulator_lab: tools/simulator_lab.m $(ENGINE) $(DEV) $(B)/net_slirp.o $(B)/share.o $(B)/audio_mac.o $(B)/vm.o $(B)/snapshot.o $(B)/usb_host.o build/simulator-restore/libhengerestore.a
+	$(CC) $(CFLAGS) -fobjc-arc $^ $(SLIRP_LIBS) -lz -liconv -lresolv -lcompression \
+	    -framework Foundation -framework UIKit -framework CFNetwork -framework Security -framework SystemConfiguration \
+	    -framework AudioToolbox -framework Metal -framework IOSurface -framework QuartzCore \
+	    -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers -o $@
+
+build/simulator-restore/libhengerestore.a: tools/build_ios_restore.sh host/libusb_shim.c host/install.c host/curl_shim.m
+	tools/build_ios_restore.sh simulator
+
 # mmu.c: no SIMD (hv_tlb_refill runs with the guest's SIMD registers live).
 $(B)/mmu.o: core/mmu.c core/*.h host/*.h | $(B)
 	$(CC) $(CFLAGS) -mgeneral-regs-only -c $< -o $@
@@ -86,15 +99,22 @@ $(B)/test_operands: tests/test_operands.c tests/operand_cases.s $(B)/operands.o
 $(B)/test_mmu: tests/test_mmu.c $(ENGINE)
 	$(CC) $(CFLAGS) tests/test_mmu.c $(ENGINE) -o $@
 
+$(B)/test_rosetta_4k: tests/test_rosetta_4k.c tests/rosetta_4k_programs.S $(ENGINE)
+	$(CC) $(CFLAGS) $^ -o $@
+
 $(B)/test_shutdown: tests/test_shutdown.c $(ENGINE)
 	$(CC) $(CFLAGS) $^ -o $@
+
+# Use the same pinned lifecycle bridge that both production frameworks build.
+$(B)/mainline-native-bridge.c: ios/engine-mainline.txt | $(B)
+	git show "$$(cat $<):ios/Henge/Native/henge-vm.c" > $@
 
 # Native app lifecycle with real devices and networking; no restore assets.
 $(B)/test_dns_lifecycle: tests/test_dns_lifecycle.c $(B)/dns_proxy.o
 	$(CC) $(CFLAGS) $^ -o $@
 
-$(B)/test_vm_lifecycle: tests/test_vm_lifecycle.c ios/Henge/Native/henge-vm.c $(ENGINE) $(DEV) $(B)/vm.o $(B)/snapshot.o $(B)/audio_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/usb_host.o
-	$(CC) $(CFLAGS) -Iios/Henge/Native $^ $(SLIRP_LIBS) $(METAL_LIBS) -framework AudioToolbox -lcompression -o $@
+$(B)/test_vm_lifecycle: tests/test_vm_lifecycle.c $(B)/mainline-native-bridge.c $(ENGINE) $(DEV) $(B)/vm.o $(B)/snapshot.o $(B)/audio_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/usb_host.o
+	$(CC) $(CFLAGS) -Itests/support -Iios/Henge/Native $^ $(SLIRP_LIBS) $(METAL_LIBS) -framework AudioToolbox -lcompression -o $@
 
 test-vm-lifecycle: $(B)/test_vm_lifecycle
 	$(B)/test_vm_lifecycle
@@ -113,7 +133,8 @@ $(B)/test_%: tests/test_%.c tests/%_programs.S tests/harness.S tests/harness.h $
 	$(CC) $(CFLAGS) -Itests tests/test_$*.c tests/$*_programs.S tests/harness.S $(ENGINE) -o $@
 
 test: all
-	@ulimit -s 65520; for t in $(TESTS); do echo "== $$t"; $$t || exit 1; done # a test keeps a whole HvCpu (2 MB of TLB and more) on its stack
+	@ulimit -s 65520; for t in $(TESTS); do echo "== $$t"; $$t; rc=$$?; [ $$rc -eq 0 ] || [ $$rc -eq 77 ] || exit $$rc; done
+	@$(B)/test_rosetta reference; rc=$$?; [ $$rc -eq 0 ] || [ $$rc -eq 77 ]
 
 $(B):
 	mkdir -p $(B)
@@ -130,11 +151,24 @@ IOS_SDK = $(shell xcrun --sdk iphoneos --show-sdk-path)
 IOS_CC = xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isysroot $(IOS_SDK)
 # ios/deps/include/slirp first when it holds libslirp's headers (they are all the engine takes from there).
 IOS_DEPS ?= $(if $(wildcard ios/deps/include/slirp/libslirp.h),$(CURDIR)/ios/deps,$(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot)
-IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp
+IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp $(CACHE_CFLAGS)
 IB = build/ios
 IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/vm.c host/snapshot.c host/net_slirp.c host/dns_proxy.c host/share.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
           $(filter-out devices/pvg_mac.m,$(wildcard devices/*.c))
 IOS_OBJ = $(patsubst %.c,$(IB)/%.o,$(IOS_SRC)) $(IB)/host/enter.o $(IB)/devices/pvg_metal.o
+
+# Rebuild all users of the software page size when changing a build directory's
+# setting. A stale object must not mix 4 KB and 16 KB cache assumptions.
+CACHE_STAMPS = $(B)/.rosetta-4k-$(ROSETTA_4K_CACHE) $(IB)/.rosetta-4k-$(ROSETTA_4K_CACHE)
+# A missing stamp is phony for this invocation: switches within one filesystem
+# timestamp tick must also rebuild, even if touching the stamp gives a tie.
+.PHONY: $(filter-out $(wildcard $(CACHE_STAMPS)),$(CACHE_STAMPS))
+$(CACHE_STAMPS):
+	@mkdir -p $(dir $@)
+	@rm -f $(dir $@).rosetta-4k-*
+	@touch $@
+$(CORE) $(HOST) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/vm.o $(B)/snapshot.o $(B)/share.o $(B)/audio_mac.o $(B)/usb_host.o: $(B)/.rosetta-4k-$(ROSETTA_4K_CACHE)
+$(IOS_OBJ): $(IB)/.rosetta-4k-$(ROSETTA_4K_CACHE)
 
 $(IB)/core/mmu.o: core/mmu.c core/*.h host/*.h devices/*.h
 	@mkdir -p $(dir $@)
@@ -186,14 +220,14 @@ $(B)/test_tl_app: tests/test_tl_app.m ios/Henge/Native/henge-tl-app.m ios/Henge/
 	  -lz -lbz2 -lcompression -o $@
 # Sample Mac programs for the app's Mac apps screen, as a disk image (read by the same import path as anyone's).
 $(B)/tl-samples.dmg: tests/tl/exit3.c tl/tests/hello.c tl/tests/fnd.m tl/tests/swifty.swift tl/tests/cxx.cpp tl/tests/fw.m tl/tests/fwapp.m | $(B)
-	make -C tl build/hello build/fnd build/swifty build/cxx build/FW.app/Contents/MacOS/fwapp
+	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET $(MAKE) -C tl build/hello build/fnd build/swifty build/cxx build/FW.app/Contents/MacOS/fwapp
 	rm -rf $(B)/tl-samples $@ && mkdir -p $(B)/tl-samples
 	cp tl/build/hello "$(B)/tl-samples/Hello (C)"
 	cp tl/build/fnd "$(B)/tl-samples/Foundation sample"
 	cp tl/build/swifty "$(B)/tl-samples/Swift sample"
 	cp tl/build/cxx "$(B)/tl-samples/C++ sample"
 	ditto tl/build/FW.app "$(B)/tl-samples/Framework sample.app"
-	hdiutil create -quiet -srcfolder $(B)/tl-samples -volname "Henge Samples" -fs HFS+ -format UDZO $@
+	hdiutil create -srcfolder $(B)/tl-samples -volname "Henge Samples" -fs HFS+ -format UDZO $@
 	xattr -c $@ # codesign refuses an app holding a file with Finder information
 
 $(B)/tl-exit3: tests/tl/exit3.c | $(B)
@@ -264,3 +298,6 @@ $(B)/test_jit_advice: ios/Henge/JIT/JITNetworkAdvice.swift tests/test_jit_advice
 test-jit-advice: $(B)/test_jit_advice
 	$(B)/test_jit_advice
 .PHONY: test-jit-advice
+test-ios-jit:
+	bash ios/scripts/check_jit.sh
+.PHONY: test-ios-jit

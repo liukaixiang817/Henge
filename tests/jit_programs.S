@@ -9,6 +9,37 @@
     .globl _jit_programs_finish
 _jit_programs_begin:
 
+// Keep every output in a separate GPR; native execution is the oracle.
+PROGRAM cfinv_all
+    .irp n,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+    mov x19, #\n
+    lsl x19, x19, #28
+    msr nzcv, x19
+    cfinv
+    mrs x\n, nzcv
+    .endr
+    END cfinv_all
+
+PROGRAM xaflag_all
+    .irp n,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+    mov x19, #\n
+    lsl x19, x19, #28
+    msr nzcv, x19
+    xaflag
+    mrs x\n, nzcv
+    .endr
+    END xaflag_all
+
+PROGRAM axflag_all
+    .irp n,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+    mov x19, #\n
+    lsl x19, x19, #28
+    msr nzcv, x19
+    axflag
+    mrs x\n, nzcv
+    .endr
+    END axflag_all
+
 PROGRAM arith
     add x0, x1, x2
     sub x3, x4, x5, lsl #7

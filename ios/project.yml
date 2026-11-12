@@ -39,6 +39,8 @@ targets:
       - path: Henge/AppIcon.icon
         type: file
         buildPhase: resources
+      # Import/export is independent of the selected execution engine.
+      - path: ../host/hvsparse.c
       # The messages the app and its JIT helper exchange.
       - path: HengeJITHelper/HengeJITMessages.swift
     settings:
@@ -55,6 +57,7 @@ targets:
           - "$(inherited)"
           - "@executable_path/Frameworks"
         HEADER_SEARCH_PATHS:
+          - "$(SRCROOT)/Engine"
           - "$(SRCROOT)/../core"
           - "$(SRCROOT)/../host"
           - "$(SRCROOT)/../devices"
@@ -64,22 +67,13 @@ targets:
           - "$(SRCROOT)/deps/lib"
         OTHER_LDFLAGS:
           - "$(inherited)"
-          # The engine (make ios-lib) and what its network needs (scripts/fetch_deps.sh).
-          - "-lhengevm"
-          # The installer (tools/build_ios_restore.sh): libirecovery, usbmuxd, idevicerestore and their libraries.
-          - "-lhengerestore"
-          - "-lz"
-          - "-lslirp"
-          - "-lglib-2.0"
-          - "-lintl"
-          - "-lpcre2-8"
-          - "-liconv"
-          - "-lresolv"
-          - "-lcompression"
+          # The Mac app loader is independent of the selected VM engine.
           - "-lhengetl"
+          - "-lz"
           # Henge's AppKit is found by name at run time (objc_getClass): keep every Objective-C class it has.
           - "-ObjC"
           - "-lbz2"
+          - "-lcompression"
           # On-device pairing for Built-in StikJIT (from Husk's src/rppairing-ios).
           - "-lhusk_rppairing"
           - "-framework"
@@ -110,10 +104,25 @@ targets:
         script: |
           set -e
           cd "$SRCROOT/.."
-          make ios-lib build/henge-agent.gz build/tl-samples.dmg
-          ./tools/build_ios_restore.sh
+          make build/henge-agent.gz build/ios/libhengetl.a build/tl-samples.dmg
+          python3 tools/build_ios_engines.py --sdk "$PLATFORM_NAME"
         basedOnDependencyAnalysis: false
     postBuildScripts:
+      - name: Embed selectable engines
+        # Copy only: neither framework is a linker dependency of the app.
+        script: |
+          set -e
+          for NAME in HengeMainlineEngine HengeRosettaEngine; do
+            SRC="$SRCROOT/../build/engines/$PLATFORM_NAME/Frameworks/$NAME.framework"
+            DST="$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH/$NAME.framework"
+            rm -rf "$DST"
+            mkdir -p "$(dirname "$DST")"
+            ditto --norsrc --noextattr "$SRC" "$DST"
+            if [ -n "$EXPANDED_CODE_SIGN_IDENTITY" ] && [ "$CODE_SIGNING_ALLOWED" != "NO" ]; then
+              codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" --timestamp=none "$DST"
+            fi
+          done
+        basedOnDependencyAnalysis: false
       - name: Bundle the Mac helper
         # What runs inside macOS for the clipboard and shared folder (tools/henge-agent.m).
         script: |

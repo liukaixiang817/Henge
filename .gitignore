@@ -1,1 +1,5 @@
 build/
+ios/deps/
+ios/Henge.xcodeproj/
+__pycache__/
+/ios/com.apple.DeveloperTools/

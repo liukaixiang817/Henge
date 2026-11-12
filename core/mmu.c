@@ -405,8 +405,8 @@ void hv_tlb_protect_code(HvCpu *cpu, const uint8_t *host_page) {
         }
 }
 
-/* Forget one salt's cached targets in one 16 KB page. A page's 4096 possible
-   targets have 4096 known slots in each table, so only those are looked at. */
+/* Forget one salt's cached targets in one software page. Each 256-byte piece
+   names 64 instruction slots; the hint is relative to this page's base. */
 /* local: cpu itself (it may empty the page's hint slot afterwards). */
 static void ijc_clear_page(HvCpu *cpu, uint64_t page, int kernel, uint64_t salt, int local) {
     HvPerCpu *m = cpu->pc_state;
@@ -419,7 +419,7 @@ static void ijc_clear_page(HvCpu *cpu, uint64_t page, int kernel, uint64_t salt,
     for (int t = kernel; t < HV_IJC_TABLES; t += 2) {
         if (!(m->ijc_tables_used >> t & 1)) continue;
         uint64_t *tab = m->ijc + (size_t)t * (HV_IJC_TABLE_BYTES / 8);
-        for (uint32_t piece = 0; piece < 64; piece++) {
+        for (uint32_t piece = 0; piece < (1u << (HV_TLB_PAGE_BITS - 8)); piece++) {
             if (!(bits >> piece & 1)) continue;
             for (uint32_t o = piece * 64; o < piece * 64 + 64; o++) {
                 uint64_t tag = (page | (uint64_t)o << 2) ^ salt;
@@ -532,22 +532,25 @@ void hv_ijc_drop_range(HvCpu *cpu, uint64_t va, uint64_t len, int asid) {
         }
     }
     /* Page by page, but only in the range's 32 MB chunks that hold cached targets (a big unmapping, a heap or a
-       file, mostly holds none); past 4096 such pages, scanning costs more than the cold start: drop the address space. */
+       file, mostly holds none); past 64 MB of such pages, drop the address space. */
     uint64_t c0 = va >> 25, c1 = (va + len - 1) >> 25, n = 0;
+    const uint64_t max_pages = (64ull << 20) >> HV_TLB_PAGE_BITS;
     int wide = c1 - c0 >= 255; /* the chunk bits wrap at 8 GB */
-    for (uint64_t c = c0; !wide && c <= c1 && n < 4096; c++)
+    for (uint64_t c = c0; !wide && c <= c1 && n < max_pages; c++)
         if (cpu->pc_state->cid_chunks[cid][(c & 255) >> 6] >> (c & 63) & 1) {
-            uint64_t a = c << 11 > first ? c << 11 : first, b = ((c + 1) << 11) - 1 < last ? ((c + 1) << 11) - 1 : last;
+            uint64_t a = c << (25 - HV_TLB_PAGE_BITS) > first ? c << (25 - HV_TLB_PAGE_BITS) : first;
+            uint64_t b = ((c + 1) << (25 - HV_TLB_PAGE_BITS)) - 1 < last ? ((c + 1) << (25 - HV_TLB_PAGE_BITS)) - 1 : last;
             n += b - a + 1;
         }
-    if (wide || n >= 4096) {
+    if (wide || n >= max_pages) {
         if (m->stats_interval) m->stats.ijc_reset_kind[3]++;
         hv_ijc_drop_asid(cpu, (uint16_t)asid);
         return;
     }
     for (uint64_t c = c0; c <= c1; c++) {
         if (!(cpu->pc_state->cid_chunks[cid][(c & 255) >> 6] >> (c & 63) & 1)) continue;
-        uint64_t a = c << 11 > first ? c << 11 : first, b = ((c + 1) << 11) - 1 < last ? ((c + 1) << 11) - 1 : last;
+        uint64_t a = c << (25 - HV_TLB_PAGE_BITS) > first ? c << (25 - HV_TLB_PAGE_BITS) : first;
+        uint64_t b = ((c + 1) << (25 - HV_TLB_PAGE_BITS)) - 1 < last ? ((c + 1) << (25 - HV_TLB_PAGE_BITS)) - 1 : last;
         for (uint64_t p = a; p <= b; p++)
             if (ucode_has(cpu->pc_state, cid, p << HV_TLB_PAGE_BITS)) {
                 m->stats.reset_why[2]++;
@@ -594,7 +597,7 @@ static void write_guard(HvCpu *cpu, HvRam *ram, uint64_t pg, uint32_t code, HvTl
 }
 
 /* HV_KVA_HIST (measuring, for a kernel fastmem window): which kernel VAs get TLB fills, per GB from the bottom of xnu's
-   kernel VA space, and how many distinct 16 KB pages. hv_kva_hist_dump writes it out. */
+   kernel VA space, and how many distinct software pages. hv_kva_hist_dump writes it out. */
 #define KVA_GBS 2048 /* buckets: 2048 of 1 GB from 0xfffffe0000000000 by default; HV_KVA_BASE (hex) and HV_KVA_SHIFT move and widen them */
 static uint64_t KVA_BASE = 0xfffffe0000000000ull;
 static int kva_shift = 30;
@@ -663,7 +666,7 @@ static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
    HV_WALK_ANY: a process switch, which saves and restores many entries and the stashes. */
 #define HV_WALK_ANY (~0ull)
 #define WALK_LOG 8
-#define WALK_PAGE_BITS 0x00ffffffffffc000ull /* by the low 56 bits, as drops compare tagged addresses */
+#define WALK_PAGE_BITS (0x00ffffffffffffffull & ~PAGE_MASK) /* by the low 56 bits, as drops compare tagged addresses */
 
 static void walk_begin(HvCpu *cpu, uint64_t va) {
     HvPerCpu *p = cpu->pc_state;
@@ -742,7 +745,7 @@ int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid) {
     for (int t = 0; t < 3; t++) { /* the slot whatever its tag byte, as hv_tlb_flush_va_asid does */
         HvTlbEntry *e = hv_tlb_ent(target, idx, t);
         uint64_t x = __atomic_load_n(&e->exec_tag, __ATOMIC_RELAXED);
-        if (x != HV_TLB_INVALID && ((hv_exec_key(x, e->addend) ^ va) & 0x00ffffffffffc000ull) == 0) fetched = 1;
+        if (x != HV_TLB_INVALID && ((hv_exec_key(x, e->addend) ^ va) & 0x00ffffffffffffffull & ~PAGE_MASK) == 0) fetched = 1;
         __atomic_store_n(&e->read_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
         __atomic_store_n(&e->write_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
         __atomic_store_n(&e->exec_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
@@ -783,7 +786,7 @@ int hv_tlbi_drop_remote_range(HvCpu *target, uint64_t va, uint64_t npages, int a
             uint64_t x = __atomic_load_n(&e->exec_tag, __ATOMIC_RELAXED);
             /* the slot whatever its tag, as for one page; fetched if it holds code from the range */
             if (x != HV_TLB_INVALID) {
-                uint64_t off = ((hv_exec_key(x, e->addend) & 0x00ffffffffffc000ull) - (va & 0x00ffffffffffc000ull)) & 0x00ffffffffffffffull;
+                uint64_t off = ((hv_exec_key(x, e->addend) & WALK_PAGE_BITS) - (va & WALK_PAGE_BITS)) & 0x00ffffffffffffffull;
                 if (off < (npages << HV_TLB_PAGE_BITS)) fetched = 1;
             }
             __atomic_store_n(&e->read_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
@@ -888,7 +891,8 @@ void hv_ijc_fill(HvCpu *cpu, HvBlock *b) {
     ent[1] = (uint64_t)(uintptr_t)b->code;
     pcs->ijc_tables_used |= 1u << (b->flags & (HV_IJC_TABLES - 1));
     {   /* the page's hint: which piece has a target now */
-        uint64_t key = ((b->va & ~(uint64_t)PAGE_MASK) ^ cpu->ijc_salt[kernel]) | 1, bit = 1ull << ((b->va >> 8) & 63);
+        uint64_t key = ((b->va & ~(uint64_t)PAGE_MASK) ^ cpu->ijc_salt[kernel]) | 1;
+        uint64_t bit = 1ull << ((b->va & PAGE_MASK) >> 8);
         __typeof__(pcs->ijc_hint[0][0]) *h = &pcs->ijc_hint[kernel][hint_slot(key)];
         if (h->key == key) h->bits |= bit;
         else if (!h->key) h->bits = bit, __atomic_store_n(&h->key, key, __ATOMIC_RELEASE);

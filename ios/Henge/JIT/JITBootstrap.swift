@@ -3,8 +3,8 @@ import Foundation
 import UIKit
 import os
 
-/// `csops(2)`. Reading CS_DEBUGGED is how we ask "is a debugger attached right
-/// now" without executing anything — unlike the brk probe, which costs a trap.
+/// `csops(2)`. CS_DEBUGGED records that a debugger has attached; it can stay set
+/// after detach and does not prove that executable memory is ready.
 @_silgen_name("csops")
 private func csops(_ pid: Int32, _ ops: Int32,
                    _ useraddr: UnsafeMutableRawPointer?, _ usersize: Int) -> Int32
@@ -84,13 +84,11 @@ enum JITBootstrap {
     ///
     /// StikDebug lets go after a while, and a first run spends a minute
     /// downloading 1.1 GB of guest image before QEMU starts. By the time
-    /// qemu_init() asked for memory the debugger had detached, and there is no
-    /// recovering from that in-process -- without a debugger there is no
-    /// executable memory at all, and asking again later is precisely what does
-    /// not work. So claim it first and hold it.
+    /// the engine asked for memory the debugger had detached. Claim it first
+    /// and hold it; a failed claim can be retried by reconnecting the debugger.
     @discardableResult
     static func prewarm() -> Bool {
-        if prewarmed { return true }
+        if prewarmed && isLive { return true }
         // Before iOS 26 Henge can make the region itself where the device allows it (a jailbreak,
         // a debugger that attached and let go such as TrollStore's enable-jit, or dynamic-codesigning),
         // so it does not wait for CS_DEBUGGED there if jailbroken: Dopamine hides that flag from apps unless
@@ -106,14 +104,9 @@ enum JITBootstrap {
         // buffer with MAP_JIT and the translation layer makes its region itself.
         if canGrantOwnJIT && !stikDebugMayServiceTraps {
             selfGrantTried = true
-            if mapJITWorks {
-                HengeLog.log("jit", "not trapping for a JIT region (no StikDebug); MAP_JIT executes here")
-                lastFailure = nil
-                return true
-            }
-            // MAP_JIT refused (no dynamic-codesigning after all, or Dopamine): plain memory made executable, which a debugged
-            // process or a jailbreak allows -- made here, with no brk for an attach that answers none (#148)
-            HengeLog.log("jit", "not trapping for a JIT region (no StikDebug); MAP_JIT does not execute here, trying plain memory")
+            // HengeVM requires a held dual mapping even where MAP_JIT works.
+            // The self allocator tries MAP_JIT and then plain executable memory.
+            HengeLog.log("jit", "making the code region without trapping (no StikDebug)")
             prepareCompressedHeap()
             if henge_ios_jit_prewarm_self(jitBytes) {
                 prewarmed = true
@@ -122,6 +115,7 @@ enum JITBootstrap {
                 return true
             }
             releaseUnusedCompressedHeap()
+            lastFailure = "Henge could not prepare its JIT code region. Enable JIT again, then try again."
             return false
         }
         HengeLog.log("jit", "claiming \(jitBytes / (1024 * 1024)) MiB of JIT memory now, "
@@ -134,21 +128,9 @@ enum JITBootstrap {
             lastFailure = nil
             detachIfDone()
         }
-        else if mapJITWorks {
-            // Not a failure worth reporting: this is the ordinary shape of an
-            // iOS that does not need a trap servicer. QEMU maps its own buffer
-            // with MAP_JIT a moment later and runs exactly as well.
-            lastFailure = nil
-            HengeLog.log("jit", "no trap servicer, but MAP_JIT executes here -- "
-                             + "QEMU will map its own buffer")
-        } else {
-            lastFailure = "The debugger is attached but is not answering trap "
-                        + "requests, and this device will not execute a MAP_JIT "
-                        + "mapping either, so no executable memory could be "
-                        + "claimed. This happens when Henge was opened from StikDebug's "
-                        + "app list, which attaches without Henge's script: open Henge "
-                        + "from the Home Screen and tap Turn On JIT. It also happens "
-                        + "inside another container app."
+        else {
+            lastFailure = "JIT was enabled, but Henge's code region could not be prepared. "
+                        + "Tap Turn On JIT in Henge to reconnect with its JIT script, then try again."
         }
         HengeLog.log("jit", ok ? "JIT region secured; it will be handed to QEMU later"
                               : "JIT prewarm FAILED -- StikDebug is not servicing traps")
@@ -178,14 +160,11 @@ enum JITBootstrap {
     /// The one try at making the region without a debugger has been made (it is not repeated: the answer will not change).
     nonisolated(unsafe) static private var selfGrantTried = false
 
-    /// Whether Henge has JIT now: a debugger marked it, or the region is already held. Before iOS 26 this tries, once, to make
-    /// the region itself, which is all TrollStore and jailbroken devices need. Cheap after the first call, and logs nothing.
+    /// HengeVM can start only with a held, tested dual mapping. A debugged flag
+    /// or a working MAP_JIT probe alone cannot supply the mapping it consumes.
+    /// Before iOS 26, try the self-granted route once for TrollStore/jailbreaks.
     static var ready: Bool {
-        if prewarmed || isLive { return true }
-        // On a TXM device the debugger must also answer the brk that claims the region. CS_DEBUGGED alone is what opening
-        // Henge from StikDebug's app list gives (no Henge script) or LiveContainer, and an install then stops at
-        // "Henge has no JIT region" (#23).
-        if debuggedFlag { return !deviceEnforcesTXM }
+        if henge_ios_jit_get_mapping() != nil && isLive { return true }
         guard canGrantOwnJIT, !selfGrantTried else { return false }
         return prewarm()
     }
@@ -268,19 +247,11 @@ enum JITBootstrap {
     /// For display only: views must never trigger the probe.
     nonisolated(unsafe) static private(set) var mapJITResult: Bool?
 
-    /// True only after a JIT region has been allocated AND passed the execute
-    /// self-test — which happens inside `qemu_init`. It is therefore always false
-    /// before the guest starts, and must NOT be used to decide whether to start it.
-    /// Use `isDebuggerAttached` for that, and this afterwards to confirm it worked.
+    /// True after the allocator's execute self-test succeeds, before a guest starts.
     static var isLive: Bool { henge_ios_jit_is_available() }
 
-    /// The actual precondition for starting the guest: StikDebug has attached.
-    ///
-    /// Checked with csops/CS_DEBUGGED rather than the `brk #0x69` probe, because
-    /// this costs nothing and is safe to call repeatedly — the brk probe traps
-    /// every time, and every trap is a chance to hit a moment when StikDebug is
-    /// not listening. The brk probe still runs once, inside the allocator, where
-    /// its answer is immediately acted on.
+    /// A cheap indication that JIT acquisition may be attempted. This flag may
+    /// outlive the debugger; use `ready` to decide whether a guest can start.
     static var isDebuggerAttached: Bool {
         guard let flags = csStatus() else {
             HengeLog.log("jit", "csops failed (errno \(errno)); assuming no debugger")
@@ -403,9 +374,9 @@ enum JITBootstrap {
                              + "\(encoded.count) chars encoded); sending inline")
             url += "&script-data=\(encoded)"
         } else {
-            HengeLog.log("jit", "WARNING: could not load henge-jit.js from the bundle. "
-                             + "Falling back to whatever script StikDebug has assigned "
-                             + "to this bundle id -- if none, JIT will not be enabled.")
+            lastFailure = "Henge's JIT script is missing from this installation. Reinstall Henge."
+            HengeLog.log("jit", lastFailure!)
+            return false
         }
 
         guard let launchURL = URL(string: url) else {

@@ -88,15 +88,18 @@ final class JITCoordinator: ObservableObject {
     /// What to tell the user, and which buttons to offer, for the last connection problem.
     @Published private(set) var advice: JITAdvice?
     @Published private(set) var busy = false
+    @Published private(set) var ready = false
     @Published private(set) var status: String?
     @Published private(set) var error: String?
     @Published private(set) var txmPresent: Bool?
     /// The setup check passed for the current pairing file.
     @Published private(set) var prepared = false
     @Published private(set) var pairingSource = JITPairingFileStore.source
-    /// Bumped each time the built-in helper attaches. Henge stays in the
-    /// foreground for that, so nothing else tells ContentView to claim the region.
+    /// Bumped only after the code region has been prepared and tested.
     @Published private(set) var attachGeneration = 0
+
+    private var waitingForStikDebugReturn = false
+    private var leftForStikDebug = false
 
     var hasPairing: Bool { pairingSource != nil }
 
@@ -144,6 +147,25 @@ final class JITCoordinator: ObservableObject {
     }
 
     private func log(_ line: String) { HengeLog.log("jit", line) }
+
+    /// A return from another app may be a manual debugger attach. During an
+    /// enable request, its readiness timer owns preparation instead, so a stale
+    /// CS_DEBUGGED flag cannot complete the request before the hand-off.
+    func scenePhaseChanged(_ phase: ScenePhase) {
+        if waitingForStikDebugReturn && phase != .active { leftForStikDebug = true }
+        guard phase == .active else { return }
+        if !busy { JITBootstrap.prewarm() }
+        ready = JITBootstrap.ready
+    }
+
+    private func enabled(_ source: String) {
+        ready = JITBootstrap.ready
+        guard ready else { return }
+        status = "JIT is on."
+        error = nil
+        attachGeneration += 1
+        log("\(source): JIT code region is ready")
+    }
 
     /// Get a debugger attached with whichever method applies, or open the setup
     /// walkthrough when that method is not set up yet.
@@ -208,6 +230,7 @@ final class JITCoordinator: ObservableObject {
             return
         }
         error = nil
+        JITBootstrap.lastFailure = nil
         connectionProblem = nil
         advice = nil
         switch resolvedMethod {
@@ -215,14 +238,14 @@ final class JITCoordinator: ObservableObject {
             assertionFailure("Automatic must resolve to a concrete JIT method")
         case .stikDebug:
             // requestAttach() calls open() on stikjit:// and cannot report failure
-            // synchronously: an unclaimed scheme fails open() silently. Wait for
-            // CS_DEBUGGED so a missing StikDebug still ends in a clear message.
+            // synchronously: an unclaimed scheme fails open() silently. Wait
+            // for the prepared region so a stale debugged flag is not success.
             if JITBootstrap.requestAttach() {
                 awaitStikDebug()
             } else if JITBootstrap.requestTrollStoreAttach() {
                 awaitTrollStore()
             } else {
-                error = "StikDebug is not installed. Install it, or set up Built-in StikJIT."
+                error = JITBootstrap.lastFailure ?? "StikDebug is not installed. Install it, or set up Built-in StikJIT."
                 showSetup = true
             }
         case .trollStore:
@@ -253,14 +276,11 @@ final class JITCoordinator: ObservableObject {
         busy = true
         status = "Waiting for TrollStore to enable JIT…"
         log("waiting for TrollStore's attach")
-        _ = Self.waitForDebugger(timeout: 60) { [weak self] attached in
+        _ = Self.waitForJIT(timeout: 60) { [weak self] prepared in
             guard let self else { return }
             busy = false
-            if attached {
-                status = "JIT is on."
-                error = nil
-                attachGeneration += 1
-                log("TrollStore enabled JIT")
+            if prepared {
+                enabled("TrollStore")
             } else {
                 status = nil
                 error = "TrollStore did not enable JIT. In TrollStore's Settings turn on URL Scheme, and make sure Henge was "
@@ -271,24 +291,26 @@ final class JITCoordinator: ObservableObject {
         }
     }
 
-    /// After StikDebug is asked to attach: open() cannot say whether it found StikDebug,
-    /// so watch CS_DEBUGGED the same way awaitTrollStore does.
+    /// Wait for the app to return and the script to provide a tested region;
+    /// neither URL acceptance nor a previously set debugged flag proves that.
     private func awaitStikDebug() {
         busy = true
-        status = "Waiting for StikDebug to attach…"
-        log("waiting for StikDebug's attach")
-        _ = Self.waitForDebugger(timeout: 60) { [weak self] attached in
+        waitingForStikDebugReturn = true
+        leftForStikDebug = false
+        status = "Waiting for StikDebug to prepare JIT…"
+        log("waiting for StikDebug's JIT script")
+        _ = Self.waitForJIT(timeout: 60, mayPrepare: { [weak self] in
+            self?.leftForStikDebug == true
+        }) { [weak self] prepared in
             guard let self else { return }
+            waitingForStikDebugReturn = false
             busy = false
-            if attached {
-                status = "JIT is on."
-                error = nil
-                attachGeneration += 1
-                log("StikDebug attached")
+            if prepared {
+                enabled("StikDebug")
             } else {
                 status = nil
-                error = "StikDebug did not attach within a minute. Make sure it's installed and try again."
-                log("StikDebug did not attach within a minute")
+                error = JITBootstrap.lastFailure ?? "StikDebug did not prepare JIT within a minute. Make sure it's installed and try again."
+                log("StikDebug did not prepare a JIT code region within a minute")
                 showSetup = true
             }
         }
@@ -353,6 +375,7 @@ final class JITCoordinator: ObservableObject {
     }
 
     func enableBuiltIn(attempt: Int = 1) {
+        guard (attempt > 1 || !busy), !JITBootstrap.ready else { return }
         guard let pairing = builtInPairing() else { return }
         guard let script = JITBootstrap.scriptBase64 else {
             error = "Henge's JIT script is missing from this installation. Reinstall Henge."
@@ -362,6 +385,7 @@ final class JITCoordinator: ObservableObject {
         busy = true
         JITBootstrap.helperMayBeAttached = true
         error = nil
+        JITBootstrap.lastFailure = nil
         connectionProblem = nil
         advice = nil
         if attempt == 1 { status = "Starting Henge's JIT helper…" }
@@ -379,10 +403,7 @@ final class JITCoordinator: ObservableObject {
                 log("built-in JIT failed: \(failure)")
                 showSetup = true
             } else {
-                status = "JIT is on."
-                error = nil
-                attachGeneration += 1
-                log("built-in helper attached")
+                enabled("built-in helper")
             }
         }
 
@@ -391,9 +412,10 @@ final class JITCoordinator: ObservableObject {
                 .enable(targetPID: getpid(), pairingData: pairing, scriptBase64: script, rsdPort: port),
                 started: { [weak self] in
                     if attempt == 1 { self?.status = "Waiting for the helper to attach…" }
-                    readiness = Self.waitForDebugger { attached in
-                        finish(attached ? nil : "The helper did not attach within 90 seconds. "
-                                              + "Check that LocalDevVPN is connected, then try again.")
+                    readiness = Self.waitForJIT { prepared in
+                        finish(prepared ? nil : JITBootstrap.lastFailure
+                            ?? "The helper did not prepare JIT within 90 seconds. "
+                             + "Check that LocalDevVPN is connected, then try again.")
                     }
                 },
                 completion: { [weak self] result in
@@ -404,7 +426,6 @@ final class JITCoordinator: ObservableObject {
                         HengeLog.log("jit", "helper: \(response.message)")
                         if !response.success {
                             guard let self else { return }
-                            // Not finish(): a retry keeps the screen busy and the next attempt starts its own watch.
                             if !finished,
                                retryIfAdvised(helperMessage: response.message, attempt: attempt,
                                               retry: { [weak self] in self?.enableBuiltIn(attempt: $0) }) {
@@ -413,6 +434,9 @@ final class JITCoordinator: ObservableObject {
                                 return
                             }
                             finish(helperFailure(response.message))
+                        } else {
+                            finish(JITBootstrap.ready ? nil : JITBootstrap.lastFailure
+                                ?? "The helper finished without preparing Henge's JIT code region. Try again.")
                         }
                     case .failure(let failure):
                         finish(failure.localizedDescription)
@@ -476,17 +500,25 @@ final class JITCoordinator: ObservableObject {
         return true
     }
 
-    /// Polls CS_DEBUGGED until it is set or `timeout` passes.
-    private static func waitForDebugger(timeout: TimeInterval = 90,
-                                        completion: @escaping (Bool) -> Void) -> Timer {
+    /// The debugger flag can precede the script, or remain set after detach.
+    /// Retry explicit preparation while an enable request is in progress, and
+    /// report success only once HengeVM's actual code region is usable.
+    private static func waitForJIT(timeout: TimeInterval = 90,
+                                   mayPrepare: @escaping () -> Bool = { true },
+                                   completion: @escaping (Bool) -> Void) -> Timer {
         let deadline = Date().addingTimeInterval(timeout)
         let timer = Timer(timeInterval: 0.5, repeats: true) { timer in
-            if JITBootstrap.debuggedFlag {
+            if JITBootstrap.ready {
                 timer.invalidate()
                 completion(true)
             } else if Date() >= deadline {
                 timer.invalidate()
                 completion(false)
+            } else if UIApplication.shared.applicationState == .active,
+                      mayPrepare(), JITBootstrap.debuggedFlag,
+                      JITBootstrap.prewarm(), JITBootstrap.ready {
+                timer.invalidate()
+                completion(true)
             }
         }
         RunLoop.main.add(timer, forMode: .common)

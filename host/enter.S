@@ -19,6 +19,8 @@
 #define CPU_NZCV 0x108
 #define CPU_V 0x140
 #define CPU_FPCR 0x340
+#define CPU_FPCR_NATIVE 0x538
+#define CPU_ROSETTA 0x540
 #define CPU_FPSR 0x348
 #define CPU_HELPER_RET 0x358
 #define CPU_HELPER_FROM 0x510
@@ -419,7 +421,12 @@ _hv_xjump_thunk:
 
 // hv_fp_enter(cpu): the guest's FPCR and FPSR into the host registers.
 _hv_fp_enter:
-    ldr x1, [x0, #CPU_FPCR]
+    ldr x2, [x0, #CPU_ROSETTA]
+    cbz x2, 1f
+    ldr x1, [x0, #CPU_FPCR_NATIVE]
+    b 2f
+1:  ldr x1, [x0, #CPU_FPCR]
+2:
     msr fpcr, x1
     ldr x1, [x0, #CPU_FPSR]
     msr fpsr, x1
@@ -427,8 +434,11 @@ _hv_fp_enter:
 
 // hv_fp_leave(cpu): and back into the HvCpu.
 _hv_fp_leave:
+    ldr x2, [x0, #CPU_ROSETTA]
+    cbnz x2, 1f
     mrs x1, fpcr
     str x1, [x0, #CPU_FPCR]
+1:
     mrs x1, fpsr
     str x1, [x0, #CPU_FPSR]
     ret

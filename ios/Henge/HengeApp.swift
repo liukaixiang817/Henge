@@ -11,6 +11,9 @@ struct HengeApp: App {
         // Order matters: HengeLog takes over stderr, so the engine's and the JIT
         // allocator's first lines land in Documents/henge.log too.
         HengeLog.start()
+        henge_engine_configure(UserDefaults.standard.bool(forKey: "henge.rosetta") ? 1 : 0,
+                               Bundle.main.privateFrameworksPath)
+        HengeLog.log("boot", "engine: \(henge_engine_rosetta() != 0 ? "Rosetta" : "mainline")")
         HengeLog.log("boot", "address space: \(henge_largest_reservation_gb()) GB can be reserved in one piece")
         EngineTuning.apply()
         HengeLog.logFootprint("app-launch")
@@ -68,28 +71,22 @@ struct RootView: View {
         .background(WindowStyle(style: running != nil ? .dark : appearance.style))
         .sheet(isPresented: $jit.showSetup) { JITSetupFlow() }
         .task(id: scenePhase) {
+            jit.scenePhaseChanged(scenePhase)
             guard scenePhase == .active else { return }
             machines.collectImports()
             jit.enableAtLaunchIfAsked()
-            // StikDebug can launch Henge before it attaches. A task also runs
-            // on the first appearance, when there may be no phase change.
+            // StikDebug may launch Henge before attaching. Keep the initial
+            // wait, while explicit enable requests own their hand-off timer.
             for _ in 0..<100 {
-                guard !Task.isCancelled else { return }
-                if JITBootstrap.prewarmed || JITBootstrap.isLive {
-                    jit.objectWillChange.send()
-                    return
-                }
-                if JITBootstrap.debuggedFlag || JITBootstrap.canGrantOwnJIT {
-                    JITBootstrap.prewarm()
-                    // Readiness lives outside the observable coordinator.
-                    jit.objectWillChange.send()
-                    return
+                guard !Task.isCancelled, !jit.ready else { return }
+                if !jit.busy && (JITBootstrap.debuggedFlag || JITBootstrap.canGrantOwnJIT) {
+                    jit.scenePhaseChanged(.active)
+                    if jit.ready { return }
                 }
                 do { try await Task.sleep(nanoseconds: 100_000_000) }
-                catch { return } // going into the background cancels this wait
+                catch { return }
             }
         }
-        .onChange(of: jit.attachGeneration) { _ in JITBootstrap.prewarm() } // the built-in helper attached
         .task { // testing only: HENGE_AUTOPILOT
             await Autopilot.run { mac in
                 // A session still on screen (its Mac stopped) is closed first: the same value again would start nothing.

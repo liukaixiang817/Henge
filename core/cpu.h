@@ -12,10 +12,10 @@ enum HvHaltReason {
 };
 
 /* One software TLB entry. host = guest VA + addend. The exec tag is the guest
-   VA of the 16 KB page. The read and write tags are that minus HV_TLB_ADJ, so
+   VA of the software page. The read and write tags are that minus HV_TLB_ADJ, so
    translated code checks "same page, and the access ends in it" for any access
    of up to 16 bytes with one subtract and shift: VA - tag = offset + 15 must
-   be below 16 KB. (An access in a page's last 15 bytes takes the slow path.)
+   be below the software page size. (The last 15 bytes take the slow path.)
    Invalid tags are HV_TLB_INVALID, which no address minus it brings near 0. */
 typedef struct HvTlbEntry {
     uint64_t read_tag;
@@ -30,10 +30,20 @@ static inline uint64_t hv_exec_key(uint64_t page_va, int64_t addend) {
     return page_va ^ ((uint64_t)addend >> 20 | (uint64_t)addend << 44);
 }
 
+/* Only the independently built Rosetta engine opts in. Guest page tables and
+   host VM allocation sizes are unchanged; larger guest pages are cached as
+   several software pages, each with its own mapping and permissions. */
+#ifndef HENGE_ROSETTA_4K_CACHE
+#define HENGE_ROSETTA_4K_CACHE 0
+#endif
+#if HENGE_ROSETTA_4K_CACHE
+#define HV_TLB_PAGE_BITS 12
+#else
 #define HV_TLB_PAGE_BITS 14
+#endif
 #define HV_TLB_ADJ 15
 #define HV_TLB_INVALID 0x8080808080808080ull /* what memset(0x80) leaves */
-#define HV_TLB_BITS 14 /* 16384 entries per EL: 256 MB of 16 KB pages (xnu's working set overflowed 64 MB) */
+#define HV_TLB_BITS 14 /* 16384 entries per EL; keep the CPU/JIT layout unchanged */
 #define HV_TLB_SIZE (1u << HV_TLB_BITS)
 #define HV_IJC_TABLES 16
 #define HV_RET_BITS 13 /* entries in a return table */
@@ -98,6 +108,12 @@ typedef struct HvCpu {
        Bits 63..48, as ijc_salt; a new value empties that half of the tables. */
     uint64_t ret_salt[2] __attribute__((aligned(128)));
     uint64_t helper_came_from; /* 0x510: where hv_helper_entry was called from, to tell if it goes back there */
+    uint64_t apflags;          /* 0x518: Apple PF/AF, NZCV bit positions */
+    uint64_t actlr_el1;        /* 0x520: tested inline by Rosetta translations */
+    uint64_t aspsr_el1;        /* 0x528: exception-saved APSTATE (P/A in bits 1/2) */
+    uint64_t afpcr_el0;        /* 0x530: Apple DAZ/FTZ */
+    uint64_t fpcr_native;      /* 0x538: effective AFP controls on the host */
+    uint64_t rosetta_mode;     /* 0x540: fixed for this machine */
     /* 0x580: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
        so toggling PAN (the kernel does it around every user copy) flushes nothing.
        [slot][EL0, EL1, EL1 with PAN, unused]: a slot's three in one 128-byte cache line. */
@@ -127,7 +143,6 @@ typedef struct HvCpu {
     uint64_t mdscr_el1;
     uint64_t csselr_el1;
     uint64_t cntkctl_el1;
-    uint64_t actlr_el1;
     uint64_t sctlr_seen;     /* MMU/FP state the current TLB contents were filled under */
     uint64_t timer_due;      /* host time this CPU's timer next fires (the dispatcher's last tick said), 0: none */
     /* TLB slots (table << HV_TLB_BITS | index) filled with user addresses since the
@@ -215,6 +230,10 @@ typedef struct HvCpu {
 #define HV_CPU_SP_EL1      0x398
 #define HV_CPU_IJC_TAB     0x440
 #define HV_CPU_TLB         0x580
+#define HV_CPU_APFLAGS     0x518
+#define HV_CPU_ACTLR       0x520
+#define HV_CPU_FPCR_NATIVE 0x538
+#define HV_CPU_ROSETTA     0x540
 #define HV_CPU_RET_SALT    0x500
 #define HV_CPU_GADDEND     0x4c0
 #define HV_CPU_XJUMP_THUNK 0x4e0
@@ -229,6 +248,10 @@ typedef struct HvCpu {
 #define HV_IJC_TABLE_BYTES ((1u << HV_IJC_BITS) * 16)
 #define HV_CPU_TLB_EL      32 /* between a slot's tables */
 
+_Static_assert(offsetof(HvCpu, apflags) == HV_CPU_APFLAGS, "AP flags layout");
+_Static_assert(offsetof(HvCpu, actlr_el1) == HV_CPU_ACTLR, "ACTLR layout");
+_Static_assert(offsetof(HvCpu, fpcr_native) == HV_CPU_FPCR_NATIVE, "AFP layout");
+_Static_assert(offsetof(HvCpu, rosetta_mode) == HV_CPU_ROSETTA, "Rosetta layout");
 _Static_assert(offsetof(HvCpu, sp) == HV_CPU_SP, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, pc) == HV_CPU_PC, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, nzcv) == HV_CPU_NZCV, "HvCpu layout");

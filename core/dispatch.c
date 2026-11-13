@@ -356,7 +356,9 @@ static uint32_t helper(HvCpu *cpu, const HvHelperInfo *info_in) {
     HvHelperInfo info_copy = *info_in;
     info_copy.op &= 0xff; /* the rest: hv_helper_thunk's refill flags */
     const HvHelperInfo *info = &info_copy;
-    if (info->op < 12 && cpu->m->stats_interval) cpu->m->stats.helper[info->op]++;
+    if(cpu->el==1 && cpu->index==0 && info->pc>>40==0xfffffe && cpu->m->compat_boot &&
+       !__atomic_load_n(&cpu->m->compat_boot_done,__ATOMIC_ACQUIRE)) cpu->m->compat_boot(cpu);
+    if (info->op < sizeof cpu->m->stats.helper / sizeof cpu->m->stats.helper[0] && cpu->m->stats_interval) cpu->m->stats.helper[info->op]++;
     if (cpu->m->stats_interval && (info->op == HV_OP_MRS || info->op == HV_OP_MSR || info->op == HV_OP_SYS))
         reg_hist[(info->insn >> 5) & 0xffff] += info->op == HV_OP_MRS ? 1 : 1ull << 32;
     switch (info->op) {
@@ -382,6 +384,10 @@ static uint32_t helper(HvCpu *cpu, const HvHelperInfo *info_in) {
     case HV_OP_EXCEPTION: {
         return hv_exception_insn(cpu, info->insn, info->pc); /* SVC: see hv_helper */
     }
+    case HV_OP_COMPAT:
+        cpu->x[8]=(cpu->nzcv&(1u<<30))==0; /* original CSET w8,ne */
+        if(cpu->m->compat_apply) cpu->m->compat_apply(cpu);
+        return 0;
     case HV_OP_ERET: {
         hv_eret(cpu);
         void *code = fast_resume(cpu);

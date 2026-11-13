@@ -11,17 +11,20 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #include "dispatch.h"
 #include "henge-ios-jit.h"
 #include "net_slirp.h"
 #include "dns_proxy.h"
 #include "vm.h"
+#include "legacy_dtree.h"
 #include "install.h"
 #include "snapshot.h"
 
 #include <fcntl.h>
 #include <unistd.h>
+#include <time.h>
 
 HENGE_EXPORT HengeDualMapping *henge_ios_jit_get_mapping(void);
 
@@ -96,6 +99,30 @@ static int started(char *err, size_t errlen) {
     atomic_fetch_add(&generation, 1);
     pthread_rwlock_unlock(&api_lock);
     return 0;
+}
+
+static int software_config(HvVmConfig *config, uint8_t bytes[6], char *err, size_t errlen) {
+    const char *mode = getenv("HV_SOFTWARE_IDENTITY");
+    if (!mode || strcmp(mode, "1")) return 0;
+    const char *mac = getenv("HV_SOFTWARE_MAC"), *serial = getenv("HV_SOFTWARE_SERIAL");
+    const char *mlb = getenv("HV_SOFTWARE_MLB");
+    if (!mac || strlen(mac) != 17 || !serial || strlen(serial) != 12 ||
+        strspn(serial, "0123456789ABCDEFGHJKLMNPQRSTUVWXYZ") != 12 || !hv_legacy_mlb_valid(mlb)) goto invalid;
+    for (int i = 0; i < 6; i++) {
+        unsigned value;
+        if (!isxdigit((unsigned char)mac[3*i]) || !isxdigit((unsigned char)mac[3*i+1]) ||
+            (i < 5 && mac[3*i+2] != ':') || sscanf(mac+3*i, "%2x", &value) != 1) goto invalid;
+        bytes[i] = (uint8_t)value;
+    }
+    /* Existing v1 profiles use LAA; v2 uses the public OUI of the verified
+       diagnostic path. The per-machine suffix still comes from its manifest. */
+    if ((bytes[0] & 3) != 2 && !(bytes[0] == 0 && bytes[1] == 0x16 && bytes[2] == 0xcb)) goto invalid;
+    config->serial = serial; config->mac_address = bytes; config->legacy_identity = 1;
+    config->mlb = mlb;
+    return 0;
+invalid:
+    snprintf(err, errlen, "This Mac's software identity is invalid.");
+    return -1;
 }
 
 static int boot_or_resume(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
@@ -189,6 +216,8 @@ static int boot_or_resume(const char *rom, const char *disk, const char *aux, ui
     }
     HvVmConfig c = {.rom = rom, .disk = disk, .aux = aux, .ecid = ecid, .seed = seed, .ram_mb = ram_mb, .ncpus = cpus, .log = 1,
                     .jit_rx = jit->rx_addr, .jit_rw = jit->rw_addr, .jit_bytes = jit->size};
+    uint8_t software_mac[6];
+    if (software_config(&c, software_mac, err, errlen)) return failed_start();
     fprintf(stderr, "henge: booting with %d CPUs, %llu MB RAM, a %zu MB JIT region\n", cpus, (unsigned long long)ram_mb,
             jit->size >> 20);
     if (hv_vm_create(&c, err, errlen) != 0) return failed_start();
@@ -203,6 +232,17 @@ static int boot_or_resume(const char *rom, const char *disk, const char *aux, ui
     }
     if (getenv("HV_STATS")) hv_vm_machine()->stats_interval = atoi(getenv("HV_STATS"));
     return started(err, errlen);
+}
+
+int henge_vm_software_identity_status(void) {
+    if(state!=1 && state!=4) return 0;
+    pthread_rwlock_rdlock(&api_lock);
+    if(state!=1 && state!=4) {pthread_rwlock_unlock(&api_lock);return 0;}
+    HvMachine *m=hv_vm_machine();
+    int board_ready=!m->compat_boot || __atomic_load_n(&m->compat_boot_done,__ATOMIC_ACQUIRE)==2;
+    int status=m->compat_match ? (board_ready && __atomic_load_n(&m->compat_pc,__ATOMIC_ACQUIRE)?2:1) : 0;
+    pthread_rwlock_unlock(&api_lock);
+    return status;
 }
 
 static volatile int install_step = -1;
@@ -231,6 +271,8 @@ int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_
     }
     HvVmConfig c = {.rom = rom, .disk = disk, .aux = aux, .ecid = ecid, .ram_mb = ram_mb, .ncpus = cpus, .log = 1,
                     .installer = 1, .no_sound = 1, .jit_rx = jit->rx_addr, .jit_rw = jit->rw_addr, .jit_bytes = jit->size};
+    uint8_t software_mac[6];
+    if (software_config(&c, software_mac, err, errlen)) return failed_start();
     fprintf(stderr, "henge: installing %s with %d CPUs, %llu MB RAM\n", ipsw, cpus, (unsigned long long)ram_mb);
     if (hv_vm_create(&c, err, errlen) != 0) return failed_start();
     install_step = 0;
@@ -459,6 +501,78 @@ int henge_vm_boot_display(const uint8_t **pixels, int *width, int *height, int *
     return result;
 }
 void henge_vm_free_display(const uint8_t *pixels) { free((void *)pixels); }
+
+void henge_vm_media_enable(int microphone, int camera) {
+    if (!lock_running()) return;
+    HvVmapple *b = hv_vm_board();
+    hv_virtio_snd_capture_enable(b->snd, microphone);
+    if (b->usb) hv_usb_camera_enable(&b->usb->camera, camera);
+    pthread_rwlock_unlock(&api_lock);
+}
+
+int henge_vm_media_demand(void) {
+    if (!lock_running()) return 0;
+    HvVmapple *b = hv_vm_board();
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    int bits = hv_virtio_snd_capture_requested(b->snd) ? 1 : 0;
+    if (b->usb && hv_usb_camera_requested(&b->usb->camera, now)) bits |= 2;
+    pthread_rwlock_unlock(&api_lock);
+    return bits;
+}
+
+uint32_t henge_vm_camera_frame_rate(void) {
+    if (!lock_running()) return 0;
+    HvVmapple *b = hv_vm_board();
+    uint32_t rate = b->usb ? hv_usb_camera_frame_rate(&b->usb->camera) : 0;
+    pthread_rwlock_unlock(&api_lock);
+    return rate;
+}
+
+void henge_vm_microphone(const float *samples, uint32_t frames) {
+    if (!lock_running()) return;
+    hv_virtio_snd_capture_push(hv_vm_board()->snd, samples, frames);
+    pthread_rwlock_unlock(&api_lock);
+}
+
+uint32_t henge_vm_camera_resolution(void) {
+    if (!lock_running()) return 0;
+    HvVmapple *b = hv_vm_board();
+    uint32_t result = b->usb ? hv_usb_camera_profile(&b->usb->camera) : 0;
+    pthread_rwlock_unlock(&api_lock);
+    return result;
+}
+
+int henge_vm_camera_set_resolution(uint32_t profile, const uint8_t *black, uint32_t length) {
+    if (!lock_running()) return -1;
+    HvVmapple *b = hv_vm_board();
+    int result = b->usb ? hv_usb_camera_set_profile(&b->usb->camera, profile, black, length) : -1;
+    hv_machine_wake(hv_vm_machine());
+    pthread_rwlock_unlock(&api_lock);
+    return result;
+}
+
+void henge_vm_camera_jpeg(const uint8_t *jpeg, uint32_t length, uint32_t profile) {
+    if (!lock_running()) return;
+    HvVmapple *b = hv_vm_board();
+    if (b->usb) {
+        hv_usb_camera_jpeg(&b->usb->camera, jpeg, length, profile);
+        hv_machine_wake(hv_vm_machine());
+    }
+    pthread_rwlock_unlock(&api_lock);
+}
+
+void henge_vm_camera_nv12(const uint8_t *y, uint32_t ys, const uint8_t *uv,
+                          uint32_t uvs, uint32_t width, uint32_t height, int mirrored) {
+    if (!lock_running()) return;
+    HvVmapple *b = hv_vm_board();
+    if (b->usb) {
+        hv_usb_camera_nv12(&b->usb->camera, y, ys, uv, uvs, width, height, mirrored);
+        hv_machine_wake(hv_vm_machine());
+    }
+    pthread_rwlock_unlock(&api_lock);
+}
 
 #if TARGET_OS_IPHONE
 size_t henge_available_memory(void) { return os_proc_available_memory(); }

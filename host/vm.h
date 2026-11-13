@@ -15,6 +15,10 @@ typedef struct HvVmConfig {
     const char *disk, *aux;   /* the root disk image and the auxiliary storage */
     uint64_t aux_offset;      /* where the aux image's data starts (16 KB) */
     uint64_t ecid, seed;      /* the machine identity the disk was installed with */
+    const char *serial;               /* optional software serial, copied at creation */
+    const char *mlb;                  /* optional synthetic board identity, for experiments */
+    const uint8_t *mac_address;        /* optional six bytes, also used by the NIC */
+    int legacy_identity;              /* opt-in, version-checked software identity compatibility */
     uint64_t ram_mb;
     int ncpus;
     int log;                  /* m->log */

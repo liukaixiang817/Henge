@@ -1,54 +1,36 @@
-# .github/workflows/build-henge.yml
-#
-# Builds a Henge.ipa from your fork's main branch on a GitHub-hosted macOS
-# runner, no Mac needed. Free on a PUBLIC repo: public repos get unlimited
-# minutes on hosted runners, including macOS. On a private repo, macOS minutes
-# bill at 10x, so the free tier's ~2000 min/month is only ~200 macOS minutes.
-#
-# The IPA comes out unsigned with ad-hoc signing (package_ipa.sh's normal
-# output). SideStore/AltStore re-signs it with your certificate on install
-# and keeps the entitlements it can; increased-memory-limit only survives if
-# your certificate carries it, and Henge falls back to file-backed guest RAM
-# without it.
-
+# Manual builds of the selected iCloud branch. No account login runs in CI.
 name: Build Henge IPA
+run-name: Henge iCloud Build 104 - ${{ github.ref_name }}
 
-# Manual only (Actions tab > Build Henge IPA > Run workflow): pushes to main don't build an IPA.
 on:
   workflow_dispatch: {}
 
+permissions:
+  contents: read
+
 env:
   HUSK: ${{ github.workspace }}/Husk
-  # The Makefile takes its slirp headers from IOS_DEPS, not HUSK:
-  #   IOS_DEPS ?= $(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot
-  # (HUSK is only read by ios/scripts/fetch_deps.sh.)
   IOS_DEPS: ${{ github.workspace }}/Husk/build/ios-arm64/sysroot
 
 jobs:
   build:
-    # Xcode 27 image (arm64, GA since Oct 2026). Plain `xcode-27` is a standard
-    # runner, so it's free on public repos; `xcode-27-xlarge` is a paid larger
-    # runner. Table: https://github.com/actions/runner-images#available-images
     runs-on: xcode-27
     timeout-minutes: 120
-
     steps:
-      - name: Check out Henge (this fork)
+      - name: Check out this branch
         uses: actions/checkout@v4
         with:
           path: Henge
+          fetch-depth: 0
 
-      # fetch_deps.sh copies prebuilt pieces out of a BUILT Husk checkout:
-      # StikJIT.xcframework (vendored in Husk's repo, comes with checkout),
-      # libhusk_rppairing.a (scripts/build_rppairing_ios.sh) and the
-      # libslirp/glib/intl/pcre2 static libs (scripts/build_ios.sh).
-      - name: Check out Husk
+      - name: Check out pinned Husk dependencies
         uses: actions/checkout@v4
         with:
           repository: Leviidev/Husk
+          ref: 29abb512d81bf8cc08babcbe7f7007cb557208ef
           path: Husk
 
-      - name: Cache Husk's sources and prebuilt iOS pieces
+      - name: Cache Husk sources and iOS libraries
         uses: actions/cache@v4
         with:
           path: |
@@ -60,61 +42,79 @@ jobs:
         run: |
           set -euxo pipefail
           brew install xcodegen meson ninja pkg-config
-          # Runner images ship rustup; add the iOS target if it's missing.
           rustup target add aarch64-apple-ios || {
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             rustup target add aarch64-apple-ios
           }
+          mkdir -p "$HOME/Desktop"
 
-      # build_ios.sh builds from third_party/build/<name>; the sources are
-      # fetched by fetch_sources.sh, which Husk's own ci_build.sh runs first.
-      - name: Fetch Husk's third-party sources
+      - name: Check iCloud identity and kernel policy regressions
+        working-directory: Henge
+        run: |
+          set -o pipefail
+          mkdir -p build
+          make test-legacy-vmm test-legacy-dtree test-compat test-software-identity 2>&1 | tee build/icloud-native-regression.log
+
+      - name: Fetch Husk third-party sources
         working-directory: Husk
         run: bash scripts/fetch_sources.sh
 
-      # Henge only needs these three sysroot pieces: libffi (a glib dep),
-      # glib (whose meson subprojects also produce libpcre2-8 and libintl),
-      # and libslirp (the guest network). Skip Husk's pixman/libucontext/qemu
-      # stages entirely: that's the Android emulator, minutes instead of an
-      # hour-plus.
-      - name: Build the iOS libraries Henge needs
+      - name: Build iOS networking libraries
         working-directory: Husk
         run: bash scripts/build_ios.sh libffi glib libslirp
 
-      - name: Build Husk's on-device pairing library
+      - name: Build on-device pairing library
         working-directory: Husk
         run: bash scripts/build_rppairing_ios.sh
 
-      - name: Copy prebuilt deps into Henge
+      - name: Copy dependencies into Henge
         working-directory: Henge
         run: zsh ios/scripts/fetch_deps.sh
 
-      - name: Build the restore stack (libirecovery, usbmuxd, idevicerestore)
+      - name: Build restore stack
         working-directory: Henge
         run: zsh tools/build_ios_restore.sh
 
-      - name: Build the engine
+      - name: Build engine
         working-directory: Henge
         run: make ios-lib
 
-      - name: Package Henge.ipa
+      - name: Package iCloud IPA
         working-directory: Henge
         run: zsh ios/scripts/package_ipa.sh
 
-      - name: Upload Henge.ipa
-        uses: actions/upload-artifact@v4
-        with:
-          name: Henge-ipa-${{ github.sha }}
-          path: /Users/runner/Desktop/Henge.ipa
-          if-no-files-found: error
-
-      - name: Package Henge.tipa
+      - name: Package iCloud TIPA
         working-directory: Henge
         run: zsh ios/scripts/package_ipa.sh --trollstore
 
-      - name: Upload Henge.tipa
+      - name: Validate both iCloud packages
+        working-directory: Henge
+        run: |
+          python3 tools/validate_icloud_ci_package.py \
+            "$HOME/Desktop/Henge.ipa" "$HOME/Desktop/Henge.tipa" \
+            --commit "$GITHUB_SHA" --output build/icloud-packages.json
+
+      - name: Upload iCloud IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Henge-tipa-${{ github.sha }}
+          name: Henge-iCloud-Build104-ipa-${{ github.sha }}
+          path: /Users/runner/Desktop/Henge.ipa
+          if-no-files-found: error
+
+      - name: Upload iCloud TIPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Henge-iCloud-Build104-tipa-${{ github.sha }}
           path: /Users/runner/Desktop/Henge.tipa
           if-no-files-found: error
+
+      - name: Upload validation and build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Henge-iCloud-Build104-validation-${{ github.sha }}
+          path: |
+            Henge/build/icloud-packages.json
+            Henge/build/icloud-native-regression.log
+            Henge/ios/build/DerivedData.buildlog
+          if-no-files-found: warn

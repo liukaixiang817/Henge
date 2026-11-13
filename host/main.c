@@ -24,6 +24,7 @@
 #include "vm.h"
 #include "install.h"
 #include "snapshot.h"
+#include "legacy_vmm.h"
 #include <dispatch/dispatch.h>
 
 /* The machine lives in vm.c; these name its parts here. */
@@ -559,6 +560,11 @@ static void *input_thread(void *unused) {
         int x, y;
         if (sscanf(line, "click %d %d", &x, &y) == 2) pointer_to(x, y), click_here();
         else if (sscanf(line, "move %d %d", &x, &y) == 2) pointer_to(x, y);
+        else if (sscanf(line, "rel %d %d", &x, &y) == 2) {
+            hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_X, x);
+            hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_Y, y);
+            hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+        }
         else if (sscanf(line, "scroll %d %d", &x, &y) == 2) {
             if (y) hv_vm_mouse_wheel(y);
             if (x) hv_vm_mouse_hwheel(x);
@@ -601,6 +607,16 @@ static void *input_thread(void *unused) {
             fprintf(stderr, "dis %llx pa %llx fsc %u:", (unsigned long long)va, (unsigned long long)wv.pa, (unsigned)wv.fsc);
             for (int k = 0; w && k < 64; k++) fprintf(stderr, " %08x", w[k]);
             fprintf(stderr, "\n");
+        }
+        else if (!strcmp(line,"legacy-vmm on") || !strcmp(line,"legacy-vmm off")) {
+            if (hv_vm_pause()==0) {
+                char err[160];
+                if (line[11]=='o' && line[12]=='n') {
+                    if (hv_legacy_vmm_enable(err,sizeof err)) fprintf(stderr,"hengevm: legacy identity: %s\n",err);
+                } else hv_legacy_vmm_disable();
+                hv_vm_continue();
+                dispatch_semaphore_signal(resume_go);
+            }
         }
         else if (!strncmp(line, "devstate", 8)) { /* debugging: what each device has been asked and not answered */
             HvVmapple *bd = hv_vm_board();
@@ -714,6 +730,17 @@ static void *input_thread(void *unused) {
         }
         else if (sscanf(line, "wait %d", &x) == 1) sleep((unsigned)x);
         else if (!strncmp(line, "type ", 5)) type_text(line + 5);
+        else if (!strncmp(line,"type-secret ",12)) { /* Read once from a private FIFO; never log its contents. */
+            char secret[512]={0};
+            FILE *sf=fopen(line+12,"rb");
+            struct stat st;
+            int private_fifo=sf && !fstat(fileno(sf),&st) && S_ISFIFO(st.st_mode) && st.st_uid==geteuid() && (st.st_mode&0777)==0600;
+            size_t n=private_fifo ? fread(secret,1,sizeof secret-1,sf) : 0;
+            if(sf) fclose(sf);
+            if(n && n<sizeof secret-1 && !memchr(secret,'\n',n) && !memchr(secret,'\r',n)) type_text(secret);
+            volatile unsigned char *clear=(void *)secret;
+            for(size_t j=0;j<sizeof secret;j++) clear[j]=0;
+        }
         else if (!strncmp(line, "prof ", 5)) prof_dump(line + 5);
         else if (!strncmp(line, "balloon ", 8)) { /* MB the guest should hand back (HV_BALLOON set at boot) */
             HvVmapple *bd = hv_vm_board();
@@ -1067,6 +1094,9 @@ int main(int argc, char **argv) {
     uint64_t seed = 0, ecid = 0, ram_mb = 4096, aux_offset = 16384;
     const char *install_ipsw = NULL, *resume_path = NULL;
     const char *share_folder = NULL;
+    const char *serial=NULL,*mlb=NULL;
+    int legacy_identity=0;
+    uint8_t identity_mac[6];int has_identity_mac=0;
     int log = 1, trace = 0, use_pvg = 1, no_chain = 0;
     const char *screenshot = NULL;
     uint64_t watch = 0, watch_pa = 0;
@@ -1074,6 +1104,7 @@ int main(int argc, char **argv) {
     uint64_t brk = ~0ull, brk_hits = 1, dump_pa = 0, dump_len = 0;
     const char *dump_path = NULL;
     for (int i = 1; i < argc; i++) {
+        if(!strcmp(argv[i],"--legacy-identity")) {legacy_identity=1;continue;}
         if (!strcmp(argv[i], "--window")) {
             window = 1;
             continue;
@@ -1106,6 +1137,16 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--disk")) disk_path = argv[++i];
         else if (!strcmp(argv[i], "--aux")) aux_path = argv[++i];
         else if (!strcmp(argv[i], "--ecid")) ecid = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--serial")) serial=argv[++i];
+        else if (!strcmp(argv[i], "--mlb")) {if(i+1>=argc)usage();mlb=argv[++i];}
+        else if (!strcmp(argv[i], "--mac")) {
+            unsigned a[6];int n=0;
+            const char *text=argv[++i];
+            if(sscanf(text,"%2x:%2x:%2x:%2x:%2x:%2x%n",a,a+1,a+2,a+3,a+4,a+5,&n)!=6 ||
+               text[n] || (a[0]&1)) usage();
+            for(int j=0;j<6;j++) identity_mac[j]=(uint8_t)a[j];
+            has_identity_mac=1;
+        }
         else if (!strcmp(argv[i], "--ram")) ram_mb = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--seed")) seed = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--log")) log = atoi(argv[++i]);
@@ -1131,9 +1172,12 @@ int main(int argc, char **argv) {
         else usage();
     }
     if (!rom || !disk_path || !aux_path) usage();
+    if (serial && (!*serial || strlen(serial)>31 || strspn(serial,"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")!=strlen(serial))) usage();
     setvbuf(stderr, NULL, _IONBF, 0);
 
     HvVmConfig vc = {.rom = rom, .disk = disk_path, .aux = aux_path, .aux_offset = aux_offset, .ecid = ecid, .seed = seed,
+                     .serial=serial,.mlb=mlb,.mac_address=has_identity_mac?identity_mac:NULL,
+                     .legacy_identity=legacy_identity,
                      .ram_mb = ram_mb, .ncpus = ncpus, .log = log, .no_net = getenv("HV_NO_NET") != NULL,
                      .installer = install_ipsw != NULL};
     if (getenv("HV_JIT_MB")) vc.jit_bytes = (size_t)atoi(getenv("HV_JIT_MB")) << 20; /* debugging: a small region flushes often */

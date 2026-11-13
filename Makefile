@@ -9,10 +9,11 @@ HOST = $(B)/jit_region.o $(B)/enter.o $(B)/disk.o
 DEV = $(B)/pvg_lite.o $(B)/pvg_metal.o $(B)/gicv3.o $(B)/timer.o $(B)/pl011.o $(B)/pl031.o $(B)/cfg.o $(B)/bdif.o $(B)/pcie.o \
       $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_net.o $(B)/virtio_input.o $(B)/virtio_snd.o $(B)/virtio_usb.o $(B)/virtio_balloon.o $(B)/xhci.o $(B)/vmapple.o $(B)/aes.o $(B)/pl061.o $(B)/metallib.o
 ENGINE = $(CORE) $(HOST)
+DEV += $(B)/usb_camera.o
 METAL_LIBS = -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
 
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_shutdown
+        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_shutdown $(B)/test_media
 
 all: $(TESTS) $(B)/hengevm $(B)/hengevm-ref $(B)/hvsparse
 
@@ -60,8 +61,8 @@ $(B)/henge-agent.gz: $(B)/henge-agent
 $(B)/share.o: host/share.c host/share.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/audio_mac.o $(B)/vm.o $(B)/snapshot.o $(B)/usb_host.o $(B)/mac-restore/libhengerestore.a
-	$(CC) $(CFLAGS) host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/audio_mac.o $(B)/vm.o $(B)/snapshot.o $(B)/usb_host.o $(B)/mac-restore/libhengerestore.a -lz -lcompression -framework Foundation -framework CFNetwork -framework Security -framework SystemConfiguration -framework IOKit $(SLIRP_LIBS) -framework AudioToolbox -framework ParavirtualizedGraphics -framework Metal -framework IOSurface \
+$(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/audio_mac.o $(B)/vm.o $(B)/legacy_vmm.o $(B)/legacy_vmm_policy.o $(B)/legacy_dtree.o $(B)/snapshot.o $(B)/usb_host.o $(B)/mac-restore/libhengerestore.a
+	$(CC) $(CFLAGS) host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/audio_mac.o $(B)/vm.o $(B)/legacy_vmm.o $(B)/legacy_vmm_policy.o $(B)/legacy_dtree.o $(B)/snapshot.o $(B)/usb_host.o $(B)/mac-restore/libhengerestore.a -lz -lcompression -framework Foundation -framework CFNetwork -framework Security -framework SystemConfiguration -framework IOKit $(SLIRP_LIBS) -framework AudioToolbox -framework ParavirtualizedGraphics -framework Metal -framework IOSurface \
 	    -framework Foundation -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers -framework CoreFoundation \
 	    -framework AppKit -framework QuartzCore -o $@
 
@@ -89,16 +90,31 @@ $(B)/test_mmu: tests/test_mmu.c $(ENGINE)
 $(B)/test_shutdown: tests/test_shutdown.c $(ENGINE)
 	$(CC) $(CFLAGS) $^ -o $@
 
+$(B)/test_media: tests/test_media.c $(ENGINE) $(DEV)
+	$(CC) $(CFLAGS) $^ $(METAL_LIBS) -o $@
+
+# Instrument the new transport code while retaining the engine's special
+# no-SIMD compilation rules. Exercises real guest descriptor chains.
+$(B)/test_media_sanitized: tests/test_media.c devices/usb_camera.c devices/xhci.c devices/virtio_snd.c devices/virtio.c $(ENGINE) $(filter-out $(B)/usb_camera.o $(B)/xhci.o $(B)/virtio_snd.o $(B)/virtio.o,$(DEV))
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer $^ $(METAL_LIBS) -o $@
+
+$(B)/media-probe: tools/media-probe.m tools/media-probe-Info.plist | $(B)
+	xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=15.0 -fobjc-arc -Wall -Wextra -Wno-deprecated-declarations -O2 $< -Wl,-sectcreate,__TEXT,__info_plist,tools/media-probe-Info.plist -framework Foundation -framework CoreAudio -framework AVFoundation -framework CoreMedia -framework CoreVideo -o $@
+
 # Native app lifecycle with real devices and networking; no restore assets.
 $(B)/test_dns_lifecycle: tests/test_dns_lifecycle.c $(B)/dns_proxy.o
 	$(CC) $(CFLAGS) $^ -o $@
 
-$(B)/test_vm_lifecycle: tests/test_vm_lifecycle.c ios/Henge/Native/henge-vm.c $(ENGINE) $(DEV) $(B)/vm.o $(B)/snapshot.o $(B)/audio_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/usb_host.o
+$(B)/test_vm_lifecycle: tests/test_vm_lifecycle.c ios/Henge/Native/henge-vm.c $(ENGINE) $(DEV) $(B)/vm.o $(B)/legacy_vmm.o $(B)/legacy_vmm_policy.o $(B)/legacy_dtree.o $(B)/snapshot.o $(B)/audio_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/usb_host.o
 	$(CC) $(CFLAGS) -Iios/Henge/Native $^ $(SLIRP_LIBS) $(METAL_LIBS) -framework AudioToolbox -lcompression -o $@
 
 test-vm-lifecycle: $(B)/test_vm_lifecycle
 	$(B)/test_vm_lifecycle
 .PHONY: test-vm-lifecycle
+
+test-jit-high-room:
+	python3 tests/test_jit_high_room.py
+.PHONY: test-jit-high-room
 
 $(B)/test_pvg_lifecycle: tests/test_pvg_lifecycle.m $(ENGINE) $(DEV)
 	$(CC) $(CFLAGS) -fobjc-arc $^ $(METAL_LIBS) -o $@
@@ -132,7 +148,7 @@ IOS_CC = xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isy
 IOS_DEPS ?= $(if $(wildcard ios/deps/include/slirp/libslirp.h),$(CURDIR)/ios/deps,$(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot)
 IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp
 IB = build/ios
-IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/vm.c host/snapshot.c host/net_slirp.c host/dns_proxy.c host/share.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
+IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/vm.c host/legacy_vmm.c host/legacy_vmm_policy.c host/legacy_dtree.c host/snapshot.c host/net_slirp.c host/dns_proxy.c host/share.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
           $(filter-out devices/pvg_mac.m,$(wildcard devices/*.c))
 IOS_OBJ = $(patsubst %.c,$(IB)/%.o,$(IOS_SRC)) $(IB)/host/enter.o $(IB)/devices/pvg_metal.o
 
@@ -186,7 +202,7 @@ $(B)/test_tl_app: tests/test_tl_app.m ios/Henge/Native/henge-tl-app.m ios/Henge/
 	  -lz -lbz2 -lcompression -o $@
 # Sample Mac programs for the app's Mac apps screen, as a disk image (read by the same import path as anyone's).
 $(B)/tl-samples.dmg: tests/tl/exit3.c tl/tests/hello.c tl/tests/fnd.m tl/tests/swifty.swift tl/tests/cxx.cpp tl/tests/fw.m tl/tests/fwapp.m | $(B)
-	make -C tl build/hello build/fnd build/swifty build/cxx build/FW.app/Contents/MacOS/fwapp
+	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET $(MAKE) -C tl build/hello build/fnd build/swifty build/cxx build/FW.app/Contents/MacOS/fwapp
 	rm -rf $(B)/tl-samples $@ && mkdir -p $(B)/tl-samples
 	cp tl/build/hello "$(B)/tl-samples/Hello (C)"
 	cp tl/build/fnd "$(B)/tl-samples/Foundation sample"
@@ -233,6 +249,9 @@ restore-objs: $(RESTORE_OBJ)
 $(B)/test_display_targets: ios/Henge/DisplayTargetSelection.swift tests/test_display_targets.swift | $(B)
 	xcrun --sdk macosx swiftc $^ -o $@
 
+$(B)/test_camera_encoder: ios/Henge/CameraFrameEncoder.swift tests/test_camera_encoder.swift | $(B)
+	xcrun --sdk macosx swiftc -module-cache-path $(B)/swift-cache $^ -o $@
+
 # The router's hand-off to the engine, with the engine call recorded instead of made.
 $(B)/test_display_router: ios/Henge/DisplayRouter.swift ios/Henge/DisplayTargetSelection.swift tests/test_display_router.swift tests/display_engine_stub.h | $(B)
 	xcrun --sdk macosx swiftc -import-objc-header tests/display_engine_stub.h $(filter %.swift,$^) -o $@
@@ -264,3 +283,35 @@ $(B)/test_jit_advice: ios/Henge/JIT/JITNetworkAdvice.swift tests/test_jit_advice
 test-jit-advice: $(B)/test_jit_advice
 	$(B)/test_jit_advice
 .PHONY: test-jit-advice
+
+$(B)/test_legacy_vmm: tests/test_legacy_vmm.c $(B)/legacy_vmm_policy.o
+	$(CC) $(CFLAGS) $^ -o $@
+.PHONY: test-legacy-vmm
+test-legacy-vmm: $(B)/test_legacy_vmm
+	$(B)/test_legacy_vmm
+
+$(B)/test_compat: tests/test_compat.c $(ENGINE)
+	$(CC) $(CFLAGS) $^ -o $@
+.PHONY: test-compat
+test-compat: $(B)/test_compat
+	$(B)/test_compat
+
+$(B)/test_software_identity: tests/test_software_identity.swift ios/Henge/SoftwareIdentity.swift | $(B)
+	xcrun swiftc -swift-version 5 -target arm64-apple-macosx14.0 -module-cache-path $(B)/swift-module-cache $^ -o $@
+.PHONY: test-software-identity
+test-software-identity: $(B)/test_software_identity
+	$(B)/test_software_identity
+
+$(B)/icloud_guest_probe: tools/icloud_guest_probe.m | $(B)
+	xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=15.0 -fobjc-arc -O2 -Wall -Wextra -Werror $< -framework Foundation -framework IOKit -o $@
+	codesign -f -s - $@
+
+$(B)/icloud_drive_probe: tools/icloud_drive_probe.m | $(B)
+	xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=15.0 -fobjc-arc -O2 -Wall -Wextra -Werror $< -framework Foundation -o $@
+	codesign -f -s - $@
+
+$(B)/test_legacy_dtree: tests/test_legacy_dtree.c $(B)/legacy_dtree.o
+	$(CC) $(CFLAGS) $^ -o $@
+.PHONY: test-legacy-dtree
+test-legacy-dtree: $(B)/test_legacy_dtree
+	$(B)/test_legacy_dtree

@@ -23,6 +23,15 @@
 
 Download macOS, install it on the device, and use it.
 
+**iCloud test branch — 0.3.0 (104).** This branch adds experimental Apple Account
+compatibility for newly created Macs with the exact restore builds 15.6.1
+(`24G90`), 26.6.2 (`25G83`) and 27.2 (`26B123`). It includes the PR #121 memory
+reservation fix and the existing microphone/camera work. Cloud synchronization
+and App Store downloads were tested in Henge's native Mac runner; this combined
+build still needs physical iPhone/iPad acceptance. iMessage/FaceTime delivery is
+not guaranteed. See the [implementation and service results](docs/apple-account-macos26-27-testing.md).
+Use **Actions → Build Henge IPA → Run workflow** on this branch for IPA/TIPA artifacts.
+
 - **Own emulator** — iOS gives apps no hypervisor, so Henge runs the Mac's arm64 code through its own JIT, with its own MMU and devices. It doesn't use QEMU or Virtualization.framework.
 - **Installs on the device** — Henge downloads Apple's restore image and restores it the way a Mac does. No Mac needed, and nothing is decrypted or patched.
 - **Graphics** — macOS draws through a virtual GPU, and Henge replays its commands with Metal. Safari and Electron apps like Discord draw on it.

@@ -28,13 +28,14 @@ enum InstantResume {
 
     /// A whole saved Mac for these settings, and when it was saved.
     static func saved(for mac: VirtualMac, ramMB: UInt64, cpus: Int) -> Date? {
+        guard mac.softwareIdentity == nil else { return nil }
         var at: Int64 = 0
         guard henge_vm_saved_ok(file(for: mac).path, ident(for: mac, ramMB: ramMB, cpus: cpus), nil, &at) == 0 else { return nil }
         return Date(timeIntervalSince1970: TimeInterval(at))
     }
 
     /// Whether a file is there at all (the Home screen's hint; the start checks it properly).
-    static func hasSave(for mac: VirtualMac) -> Bool { FileManager.default.fileExists(atPath: file(for: mac).path) }
+    static func hasSave(for mac: VirtualMac) -> Bool { mac.softwareIdentity == nil && FileManager.default.fileExists(atPath: file(for: mac).path) }
 
     /// The file, and a half-written one from a save iOS cut short (the engine writes beside it, then renames).
     static func discard(for mac: VirtualMac) {
@@ -54,6 +55,7 @@ enum InstantResume {
 
     /// Henge is in the background: write the paused Mac out, in case iOS closes Henge. It stays paused.
     static func suspend(_ mac: VirtualMac, ramMB: UInt64, cpus: Int) {
+        guard mac.softwareIdentity == nil else { return }
         guard enabled, henge_vm_state() == 1 || henge_vm_state() == 4 else { return }
         let path = file(for: mac).path, id = ident(for: mac, ramMB: ramMB, cpus: cpus)
         var task = UIBackgroundTaskIdentifier.invalid

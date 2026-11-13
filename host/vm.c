@@ -1,4 +1,6 @@
 #include "vm.h"
+#include "legacy_vmm.h"
+#include "legacy_dtree.h"
 #include "pvg_lite.h"
 
 #include <TargetConditionals.h>
@@ -249,6 +251,10 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
         primary_started = 0;
     }
     if (!c->rom || !c->disk || !c->aux) return fail(err, errlen, "The ROM, disk and auxiliary storage are all needed.");
+    if(c->legacy_identity && (!c->serial || !*c->serial || !c->mac_address || (c->mac_address[0]&1)))
+        return fail(err,errlen,"Software identity compatibility needs a persistent serial and unicast MAC address.");
+    if(c->mlb && (!c->legacy_identity || !hv_legacy_mlb_valid(c->mlb)))
+        return fail(err,errlen,"The experimental board identity is invalid.");
     machine_created = 1;
     struct sigaction ill = {.sa_flags = SA_SIGINFO | SA_ONSTACK};
     ill.sa_sigaction = on_ill;
@@ -271,17 +277,27 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     ncpus = c->ncpus < 1 ? 1 : c->ncpus > HV_MAX_CPUS ? HV_MAX_CPUS : c->ncpus;
     m.big_lock_on = ncpus > 1 && getenv("HV_BIG_LOCK"); /* debugging: one CPU in guest code at a time */
     HvCfgParams cfg = {.nr_cpus = (uint32_t)ncpus, .ecid = c->ecid, .seed = c->seed, .mac_en0 = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01}};
+    cfg.serial=c->serial;
+    if(c->mac_address) memcpy(cfg.mac_en0,c->mac_address,6);
+    if(c->legacy_identity) {
+        uint8_t *other[]={cfg.mac_en1,cfg.mac_wifi0,cfg.mac_bt0};
+        for(unsigned i=0;i<3;i++) {
+            memcpy(other[i],c->mac_address,6);other[i][5]^=(uint8_t)(i+1);
+        }
+    }
     if (c->installer) cfg.run_installer1 = cfg.run_installer2 = 1;
     if (getenv("HV_RUN_INSTALLER")) { /* experiment: "a,b" for the two installer words */
         unsigned a = 0, b2 = 0;
         sscanf(getenv("HV_RUN_INSTALLER"), "%u,%u", &a, &b2);
         cfg.run_installer1 = a, cfg.run_installer2 = b2;
     }
-    static const uint8_t mac[6] = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01};
+    static const uint8_t default_mac[6] = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01};
+    const uint8_t *mac=c->mac_address ? c->mac_address : default_mac;
     if (hv_vmapple_create(&board, &m, cpus, (c->ram_mb ? c->ram_mb : 2048) << 20, &disk, &aux, &cfg, mac) != 0)
         return fail(err, errlen, "Cannot build the machine (not enough memory for the guest's RAM?).");
     if (hv_vmapple_load_rom(&board, c->rom) != 0) return fail(err, errlen, "Cannot read the ROM (AVPBooter.vmapple2.bin).");
     hv_vmapple_reset_cpu(&board);
+    if(c->legacy_identity) hv_legacy_vmm_configure(&m,c->mlb);
     if (board.net && !c->no_net) {
         if (hv_net_attach(&m, board.net) != 0) fprintf(stderr, "hengevm: user-mode network unavailable\n");
         else net_on = 1;
@@ -462,6 +478,8 @@ int hv_vm_finish_pause(void) {
     hv_virtio_blk_stop(board.root_blk);
     hv_virtio_blk_stop(board.aux_blk);
     if (sound_on) hv_audio_detach(); /* the host's player stops; the stream's state stays in the device */
+    hv_virtio_snd_capture_enable(board.snd, 0);
+    if (board.usb) hv_usb_camera_enable(&board.usb->camera, 0);
     hv_pvg_lite_quiesce(board.pvg);
     hv_dev_lock(&m);
     int idle = hv_virtio_blk_idle(board.root_blk) && hv_virtio_blk_idle(board.aux_blk);
@@ -539,8 +557,9 @@ int hv_vm_continue(void) {
     hv_virtio_blk_start(board.aux_blk);
     if (sound_on) {
         hv_audio_attach(board.snd);
-        hv_virtio_snd_resume(board.snd);
     }
+    hv_virtio_snd_resume(board.snd);
+    if (board.usb) hv_xhci_resume(board.usb);
     atomic_store(&input_stopping, 0);
     set_pause_state(0);
     return hv_vm_start(cpu0_ours, exit_cb);

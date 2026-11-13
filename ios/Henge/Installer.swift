@@ -12,6 +12,9 @@ struct MacOSRelease: Identifiable, Hashable {
     /// (installed and set up on the Mac in phone mode: Sonoma 21 GB, Ventura 19 GB).
     var macBytes: Int64 = 24 << 30
 
+    /// Only exact restore builds with verified kernel profiles and login tests.
+    var supportsSoftwareCompatibility: Bool { ["24G90", "25G83", "26B123"].contains(id) }
+
     /// The builds offered, oldest first. Apple's catalog (mesu.apple.com) only lists the newest;
     /// these are the same images from Apple's CDN, and Apple still signs them for virtual Macs.
     static let all: [MacOSRelease] = [
@@ -108,8 +111,12 @@ final class Installer: NSObject, ObservableObject {
         grace = .invalid
     }
 
-    func start(_ release: MacOSRelease, name: String, ramMB: Int, cpus: Int, keepImage: Bool) {
+    func start(_ release: MacOSRelease, name: String, ramMB: Int, cpus: Int, keepImage: Bool, softwareCompatibility: Bool = false) {
         guard !busy else { return }
+        guard !softwareCompatibility || release.supportsSoftwareCompatibility else {
+            phase = .failed("Apple Account compatibility has not been verified for this macOS build.")
+            return
+        }
         phase = .checking
         machineName = name
         UIApplication.shared.isIdleTimerDisabled = true // the screen locking would suspend the download and the restore
@@ -125,7 +132,8 @@ final class Installer: NSObject, ObservableObject {
                 HengeLog.log("install", "boot ROM ready")
                 let ipsw = try await download(release)
                 phase = .preparing
-                var mac = try prepare(name: name, ramMB: ramMB, rom: rom)
+                var mac = try prepare(name: name, ramMB: ramMB, rom: rom,
+                                      identity: softwareCompatibility ? SoftwareIdentity.make() : nil)
                 mac.osName = release.name
                 made = mac
                 phase = .installing
@@ -193,10 +201,11 @@ final class Installer: NSObject, ObservableObject {
 
     // MARK: The new machine
 
-    private func prepare(name: String, ramMB: Int, rom: URL) throws -> VirtualMac {
+    private func prepare(name: String, ramMB: Int, rom: URL, identity: SoftwareIdentity?) throws -> VirtualMac {
         // A new machine identity, as VZMacMachineIdentifier makes one: a random ECID.
         let ecid = UInt64.random(in: 1 << 40 ..< 1 << 62)
         var mac = VirtualMac(name: name, ecid: ecid, seed: 0, ramMB: ramMB, diskBytes: 64 << 30)
+        mac.softwareIdentity = identity
         (mac.screenWidth, mac.screenHeight) = Device.fittingScreen
         let fm = FileManager.default
         try fm.createDirectory(at: mac.directory, withIntermediateDirectories: true)
@@ -208,7 +217,8 @@ final class Installer: NSObject, ObservableObject {
         try h.truncate(atOffset: UInt64(64) << 30) // sparse: blocks are only used as macOS writes them
         try h.close()
         guard henge_make_aux(mac.aux.path) == 0 else { throw message("Cannot create the auxiliary storage.") }
-        let info: [String: Any] = ["name": name, "ecid": ecid, "seed": 0, "ramMB": ramMB]
+        var info: [String: Any] = ["name": name, "ecid": ecid, "seed": 0, "ramMB": ramMB]
+        if let identity { info["softwareIdentity"] = identity.manifest }
         try JSONSerialization.data(withJSONObject: info).write(to: mac.directory.appendingPathComponent("machine.json"))
         mac.diskBytes = 64 << 30
         HengeLog.log("install", "new machine \(name): ECID \(ecid), 64 GB disk")
@@ -229,6 +239,7 @@ final class Installer: NSObject, ObservableObject {
         setenv("HV_WRITE_CACHE", "0", 1) // the ~15 GB the restore writes goes straight to storage (host/disk.c); this process runs no other Mac
         let work = mac.directory.appendingPathComponent("restore", isDirectory: true)
         try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        guard SoftwareIdentity.prepare(mac.softwareIdentity) else { throw message("This Mac's software identity is invalid.") }
         var buffer = [CChar](repeating: 0, count: 256)
         let rc = henge_vm_install(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, ipsw.path, work.path, ram, Int32(cpus),
                                   &buffer, buffer.count)

@@ -24,6 +24,7 @@ enum {
     HV_OP_CLREX,
     HV_OP_WFI,
     HV_OP_WFE,         /* waits for the exclusive monitor's word to change (or a request); the block carries on */
+    HV_OP_COMPAT,      /* verified per-machine compatibility policy for CSET w8,ne */
 };
 
 #define HV_MAX_BLOCK_INSNS 128

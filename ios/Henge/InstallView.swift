@@ -10,6 +10,7 @@ struct InstallView: View {
     @State private var name = "Mac"
     @State private var ramGB = Device.suggestedRAMGB
     @State private var deleteAfter = false
+    @State private var softwareCompatibility = false
     @State private var refresh = 0 // redraws the list when a download is deleted
     @State private var details = false
     @State private var stageStarted = Date()
@@ -37,6 +38,7 @@ struct InstallView: View {
             }
             .background(Desk.page)
             .navigationTitle(installer.busy ? "Installing" : "Install macOS")
+            .onChange(of: release.id) { _ in if !release.supportsSoftwareCompatibility { softwareCompatibility = false } }
             .task {
                 while !Task.isCancelled { // the region may be claimed after a hand-off to StikDebug
                     jitReady = JITBootstrap.ready
@@ -111,6 +113,18 @@ struct InstallView: View {
                     .padding(.bottom, 10)
             }
             Rectangle().fill(Desk.hairline).frame(height: 0.5)
+            if release.supportsSoftwareCompatibility {
+                Toggle("Apple Account compatibility (experimental)", isOn: $softwareCompatibility)
+                    .font(.system(size: 16))
+                    .padding(.horizontal, 17).padding(.vertical, 10)
+                if softwareCompatibility {
+                    Text("Requires a new Mac running \(release.name). Creates and saves its own software identity for iCloud testing. iMessage and FaceTime depend on account activation and are not guaranteed. Instant Resume is unavailable for this Mac.")
+                        .font(.system(size: 13)).foregroundStyle(Desk.dim)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 17).padding(.bottom, 10)
+                }
+                Rectangle().fill(Desk.hairline).frame(height: 0.5)
+            }
             Toggle("Delete the download after", isOn: $deleteAfter)
                 .font(.system(size: 16))
                 .padding(.horizontal, 17)
@@ -119,7 +133,8 @@ struct InstallView: View {
         .deskCard()
 
         Button(Installer.haveImage(release) ? "Install" : "Download and Install") {
-            installer.start(release, name: name.isEmpty ? "Mac" : name, ramMB: ramGB * 1024, cpus: cpus, keepImage: !deleteAfter)
+            installer.start(release, name: name.isEmpty ? "Mac" : name, ramMB: ramGB * 1024, cpus: cpus,
+                            keepImage: !deleteAfter, softwareCompatibility: softwareCompatibility)
         }
         .buttonStyle(DeskButtonStyle(enabled: jitReady && !Device.chipTooOld))
         .disabled(!jitReady || Device.chipTooOld)

@@ -95,6 +95,7 @@ typedef struct {
     uint64_t page;       /* guest VA of the 16 KB page the block is in */
     int no_ijc;          /* indirect branches always go to the dispatcher (breakpoints, tests' stop PC) */
     HvMachine *m;
+    HvCpu *cpu;          /* the CPU synchronously emitting this block */
     uint64_t cur_pc;     /* guest PC of the instruction being translated (or whose out-of-line exit is) */
     /* Grouped accesses (Group). */
     Group grp[MAX_GROUPS];
@@ -1567,6 +1568,11 @@ static int is_fp_insn(uint32_t insn) {
 
 /* Returns 1 if the instruction ends the block. */
 static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
+    if(insn==0x1a9f07e8 && (e->flags&HV_BLOCK_EL1) &&
+       e->cpu && e->m->compat_match && e->m->compat_match(e->cpu,pc)) {
+        put_helper(e,pc,insn,HV_OP_COMPAT);
+        return 0;
+    }
     HvInsnKind kind = hv_classify(insn);
     if ((e->flags & HV_BLOCK_FPOFF) && kind != HV_INSN_UNDEFINED && is_fp_insn(insn)) {
         put_helper(e, pc, insn, HV_OP_FPTRAP);
@@ -1963,6 +1969,7 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
     e->page = b->va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
     e->no_ijc = !m->chain;
     e->m = m;
+    e->cpu = b->maker && b->maker<=HV_MAX_CPUS ? m->cpus[b->maker-1] : m->cpu;
     e->nogroup = nogroup;
     e->u_live = e->u_prev = 0;
 

@@ -125,7 +125,7 @@ typedef struct HvStats {
     uint64_t nrecent;
     uint64_t translate_ticks, translated_insns, translated_words; /* time spent translating, guest and host code size */
     uint64_t retrans_va, retrans_vapa; /* translations of a VA (and VA+PA) translated before: diagnostics */
-    uint64_t helper[12];      /* by HV_OP_* */
+    uint64_t helper[13];      /* by HV_OP_* */
     uint64_t tlb_flushes, fetch_walks, exceptions, interrupts;
     uint64_t wfi, wfi_ticks;  /* WFI exits, host ticks spent asleep */
 } HvStats;
@@ -238,6 +238,16 @@ typedef struct HvMachine {
     /* GIC CPU interface system registers (ICC_*_EL1), reg = op0:op1:CRn:CRm:op2. */
     uint64_t (*icc_read)(struct HvMachine *m, HvCpu *cpu, uint32_t reg);
     void (*icc_write)(struct HvMachine *m, HvCpu *cpu, uint32_t reg, uint64_t v);
+
+    /* Optional per-machine guest compatibility. The matcher is called only
+       for a guarded EL1 CSET site. Callbacks
+       are installed before CPUs start and never changed while they run. */
+    int (*compat_match)(HvCpu *cpu, uint64_t pc);
+    void (*compat_apply)(HvCpu *cpu);
+    uint64_t compat_pc; /* atomic publication of the validated site; 0 until seen */
+    uint32_t compat_proc_comm; /* process layout from the verified kernel profile */
+    void (*compat_boot)(HvCpu *cpu);
+    uint32_t compat_boot_done;
 
     uint64_t stop_pc;    /* tests: leave the dispatcher when pc reaches this */
     void (*stop_hook)(HvCpu *cpu); /* debugging: call this there instead of leaving */

@@ -9,6 +9,8 @@
    (henge_ios_jit_prewarm), and starts it. 0, or -1 with a reason in err. */
 int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
                   int cpus, char *err, size_t errlen);
+/* 0 off/not running, 1 requested but not matched, 2 validated guest routine. */
+int henge_vm_software_identity_status(void);
 /* Installs macOS from an IPSW onto a new machine (blank disk and auxiliary
    storage): boots the ROM in DFU mode and runs the restore over its USB port,
    as Virtualization.framework's installer does. workdir is scratch space.
@@ -96,6 +98,18 @@ void henge_vm_touch_button(int down); /* the pad's full press (a click) */
 int henge_vm_pointer(int *x, int *y);
 /* A small picture of the display, BGRA, width * height * 4 bytes. 0, or -1 before anything shows. */
 int henge_vm_snapshot(uint8_t *bgra, int width, int height);
+
+/* Host media capture. Permission gates are session-owned and default off.
+   demand bits: 1 microphone, 2 camera. Callbacks are fenced against VM teardown. */
+void henge_vm_media_enable(int microphone, int camera);
+int henge_vm_media_demand(void);
+uint32_t henge_vm_camera_frame_rate(void);
+uint32_t henge_vm_camera_resolution(void);
+int henge_vm_camera_set_resolution(uint32_t profile, const uint8_t *black_jpeg, uint32_t length);
+void henge_vm_camera_jpeg(const uint8_t *jpeg, uint32_t length, uint32_t profile);
+void henge_vm_microphone(const float *mono_48000, uint32_t frames);
+void henge_vm_camera_nv12(const uint8_t *y, uint32_t y_stride, const uint8_t *uv,
+                          uint32_t uv_stride, uint32_t width, uint32_t height, int mirrored);
 
 /* The boot framebuffer (Apple logo and progress bar), 32-bit BGRA, or -1 if
    the kernel has not got that far. A successful call returns an owned copy;

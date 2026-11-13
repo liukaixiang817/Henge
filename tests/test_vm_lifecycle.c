@@ -19,6 +19,8 @@ static HvJitRegion jit;
 static HengeDualMapping mapping;
 static int failures;
 static _Atomic int reader_done;
+static int expect_software_install, installer_identity_observed;
+static _Atomic int media_writes = 1;
 static int memory_prepared, memory_preparations, installer_started;
 void henge_ios_jit_prepare_vm_memory(void) {
     memory_prepared = 1;
@@ -37,6 +39,12 @@ int hv_install_start(HvVirtioUsb *usb, const char *ipsw, const char *work, uint6
                      HvInstallProgress progress, void *user) {
     (void)usb; (void)ipsw; (void)work; (void)ecid; (void)progress; (void)user;
     installer_started++;
+    if (expect_software_install) {
+        const uint8_t *cfg = hv_vm_board()->cfg;
+        const uint8_t wifi[] = {2, 0x48, 0x56, 0x12, 0x34, 0x52};
+        installer_identity_observed = cfg && !memcmp(cfg + 0x500, "C07KT0FAJYVX", 12)
+            && !memcmp(cfg + 0x50, wifi, 6) && hv_vm_machine()->compat_boot != NULL;
+    }
     return -1;
 }
 static void check(const char *what, int ok) {
@@ -83,11 +91,86 @@ static void *read_ui(void *unused) {
         henge_vm_gpu_frames();
         henge_vm_balloon(-1);
         henge_vm_set_display_layer(NULL);
+        const float samples[4] = {0, 0.25f, -0.25f, 0};
+        const uint8_t luma[4] = {16,16,16,16}, chroma[2] = {128,128};
+        if (atomic_load(&media_writes)) henge_vm_media_enable(1, 1);
+        henge_vm_media_demand();
+        henge_vm_camera_frame_rate();
+        henge_vm_camera_resolution();
+        if (atomic_load(&media_writes)) henge_vm_camera_set_resolution(0, NULL, 0);
+        const uint8_t jpeg[] = {0xff,0xd8,0xff,0xd9};
+        if (atomic_load(&media_writes)) {
+            henge_vm_camera_jpeg(jpeg, sizeof jpeg, 0);
+            henge_vm_microphone(samples, 4);
+            henge_vm_camera_nv12(luma, 2, chroma, 2, 2, 2, 1);
+        }
         if (!henge_vm_boot_display(&pixels, &width, &height, &stride)) henge_vm_free_display(pixels);
         usleep(500);
     }
     return NULL;
 }
+
+/* A driver has already posted an RX period, partly filled, and committed an
+   HD UVC stream. Seed this only while the tiny guest and UI writers are paused. */
+static void seed_media(void) {
+    HvVmapple *b = hv_vm_board();
+    HvVirtioSnd *s = b->snd;
+    const uint64_t base = 0x70000000;
+    memset(b->ram + 0x10000, 0, 0x5000);
+    s->vio.status = 4;
+    s->vio.q[3] = (HvVirtq){.size = 8, .enabled = 1, .last_avail = 1,
+        .desc = base + 0x10000, .avail = base + 0x11000, .used = base + 0x12000};
+    s->vio.q[3].out[0] = 1;
+    *(uint16_t *)(b->ram + 0x11002) = 1;
+    *(uint32_t *)(b->ram + 0x13000) = 1;
+    memset(b->ram + 0x14000, 0x42, 64);
+    s->capture.format = HV_VSND_FMT_FLOAT;
+    s->capture.frame_bytes = 4;
+    s->capture.buffer_bytes = 7680;
+    s->capture.period_bytes = 1920;
+    s->capture.prepared = s->capture.running = s->capture.enabled = 1;
+    s->capture.head = 7; s->capture.tail = 8; s->capture.offset = 64;
+    s->capture.pending[7] = (HvVirtqElem){.head = 0, .nseg = 2,
+        .seg = {{base + 0x13000, 4, 0}, {base + 0x14000, 1928, 1}}};
+    s->capture.delivered = 480000;
+    s->capture.samples[0] = 0.75f;
+    s->capture.written = 1;
+    HvUsbCamera *c = &b->usb->camera;
+    const uint8_t dark[] = {0xff, 0xd8, 0xff, 0xd9};
+    hv_usb_camera_set_profile(c, 2, dark, sizeof dark);
+    hv_usb_camera_apply_profile(c);
+    c->configured = c->committed = c->enabled = 1;
+    c->fid = 1;
+    memcpy(c->commit, c->probe, sizeof c->commit);
+    memset(c->latest, 0x6d, 128);
+    c->latest_len = 128;
+    c->next_frame_ns = UINT64_MAX;
+    b->usb->camera_generation = 7;
+    b->usb->slots[1].dev = 2;
+    b->usb->slots[1].camera_generation = 7;
+    b->usb->camera_reconnect_ns = 1; /* rebase this expired host deadline */
+}
+
+static void check_media_resume(void) {
+    HvVmapple *b = hv_vm_board();
+    HvVirtioSnd *s = b->snd;
+    for (int n = 0; n < 200 && *(volatile uint16_t *)(b->ram + 0x12002) == 0; n++) usleep(1000);
+    pthread_mutex_lock(&s->capture_mu);
+    check("resumed RX period completes once", *(uint16_t *)(b->ram + 0x12002) == 1 && s->capture.head == 8 && s->capture.tail == 8);
+    check("resumed microphone has a fresh clock and no saved permission", s->capture.delivered < 48000 && !s->capture.enabled && !s->capture.written);
+    check("RX partial samples survive", b->ram[0x14000] == 0x42 && b->ram[0x1403f] == 0x42);
+    check("resumed microphone emits gated silence", *(float *)(b->ram + 0x14040) == 0 && *(uint32_t *)(b->ram + 0x14780) == 0x8000);
+    pthread_mutex_unlock(&s->capture_mu);
+    HvUsbCamera *c = &b->usb->camera;
+    check("HD camera keeps its guest format", hv_usb_camera_profile(c) == 2 && c->configured && c->committed && c->width == 1920);
+    check("camera mutex survives restore", hv_usb_camera_frame_rate(c) == 30);
+    check("camera slot generation survives", b->usb->camera_generation == 7 && b->usb->slots[1].camera_generation == 7);
+    check("camera reconnect is rebased", b->usb->camera_reconnect_ns > 1);
+    uint8_t image[32];
+    size_t bytes = hv_usb_camera_read(c, image, sizeof image, 1);
+    check("camera resumes with a new black FID and no saved permission", !c->enabled && bytes == 10 && image[6] == 0xff && image[7] == 0xd8 && (image[1] & 1) == 0);
+}
+
 int main(void) {
     alarm(60);
     char dir[] = "/tmp/henge-lifecycle-XXXXXX", rom[256], disk[256], aux[256], ram[256], error[256];
@@ -153,6 +236,7 @@ int main(void) {
     }
     /* Instant resume: a counter in RAM goes on from where it was saved, in this machine and in a new one. */
     {
+        atomic_store(&media_writes, 0);
         char snap[300];
         snprintf(snap, sizeof snap, "%s/state.hsnap", dir);
         /* movz x1, #0x7000, lsl 16; loop: ldr x2, [x1]; add x2, x2, #1; str x2, [x1]; b loop */
@@ -168,7 +252,9 @@ int main(void) {
         uint64_t c1 = *count;
         usleep(20000);
         check("paused: the counter stands still", c1 > 0 && *count == c1);
+        seed_media();
         check("continue runs it on", henge_vm_continue() == 0 && henge_vm_state() == 1);
+        check_media_resume();
         for (int n = 0; n < 1000 && *count == c1; n++) usleep(1000);
         check("continued: the counter moves", *count > c1);
         rc = henge_vm_suspend(snap, "test", error, sizeof error);
@@ -186,6 +272,8 @@ int main(void) {
         rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
         usleep(30000);
         rc |= henge_vm_suspend(snap, "test", error, sizeof error);
+        seed_media();
+        rc |= henge_vm_save(snap, "test", error, sizeof error);
         c2 = *(volatile uint64_t *)hv_vm_board()->ram;
         henge_vm_stop();
         rc |= henge_vm_resume(rom, disk, aux, 1, 0, 64, 2, snap, "test", error, sizeof error);
@@ -196,6 +284,7 @@ int main(void) {
         check("resumed: the counter is where it was", *count >= c2);
         for (int n = 0; n < 1000 && *count == c2; n++) usleep(1000);
         check("resumed: the counter moves on", *count > c2);
+        check_media_resume();
         henge_vm_stop();
         for (int n = 0; n < 3000 && henge_vm_state() != 2; n++) usleep(1000);
         check("resumed Mac stops", henge_vm_state() == 2);
@@ -213,16 +302,78 @@ int main(void) {
         check("refused, it can start from cold", henge_vm_state() == 0 && henge_vm_can_start());
         unlink(snap);
     }
+    /* Exercise the app's per-Mac profile through the real native boot bridge.
+       A software identity must survive pause/continue, but never a RAM save. */
+    {
+        char snap[300];
+        snprintf(snap, sizeof snap, "%s/software.hsnap", dir);
+        uint32_t loop = 0x14000000;
+        write_file(rom, &loop, sizeof loop);
+        setenv("HV_SOFTWARE_IDENTITY", "1", 1);
+        setenv("HV_SOFTWARE_SERIAL", "C07KT0FAJYVX", 1);
+        setenv("HV_SOFTWARE_MAC", "02:48:56:12:34:50", 1);
+        setenv("HV_SOFTWARE_MLB", "C07323700J9KXPG1M", 1);
+        int rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
+        check("software identity boots through the native bridge", rc == 0);
+        if (!rc) {
+            uint8_t *cfg = hv_vm_board()->cfg;
+            const uint8_t mac[] = {2, 0x48, 0x56, 0x12, 0x34, 0x50};
+            check("software serial reaches the boot ROM", cfg && !memcmp(cfg + 0x500, "C07KT0FAJYVX", 12));
+            for (int i = 0; cfg && i < 4; i++) {
+                uint8_t want[6]; memcpy(want, mac, 6); want[5] ^= i;
+                check("each network identity is stable and distinct", !memcmp(cfg + 0x40 + 8 * i, want, 6));
+            }
+            check("compatibility waits for a verified guest kernel", henge_vm_software_identity_status() == 1);
+            check("board identity is installed before the kernel starts", hv_vm_machine()->compat_boot != NULL);
+            check("software identity can pause", henge_vm_pause(error, sizeof error) == 0);
+            check("paused Mac retains its identity status", henge_vm_software_identity_status() == 1);
+            check("RAM save is refused without creating a file", henge_vm_save(snap, "test", error, sizeof error) != 0
+                && strstr(error, "cold boot") && access(snap, F_OK) != 0);
+            check("software identity continues in memory", henge_vm_continue() == 0 && henge_vm_state() == 1);
+            henge_vm_stop();
+            for (int n = 0; n < 3000 && henge_vm_state() != 2; n++) usleep(1000);
+            check("software Mac stops and releases its status", henge_vm_state() == 2 && henge_vm_software_identity_status() == 0);
+        }
+        setenv("HV_SOFTWARE_MAC", "00:16:cb:12:34:50", 1);
+        rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
+        check("public-OUI identity boots through the app's native bridge", rc == 0);
+        if (!rc) {
+            const uint8_t mac[] = {0, 0x16, 0xcb, 0x12, 0x34, 0x50};
+            const uint8_t *cfg = hv_vm_board()->cfg;
+            for (int i = 0; cfg && i < 4; i++) {
+                uint8_t want[6]; memcpy(want, mac, 6); want[5] ^= i;
+                check("new ROM reaches all distinct boot device addresses", !memcmp(cfg + 0x40 + 8 * i, want, 6));
+            }
+            henge_vm_stop();
+            for (int n = 0; n < 3000 && henge_vm_state() != 2; n++) usleep(1000);
+            check("public-OUI machine stops without leaking compatibility state", henge_vm_state() == 2 && henge_vm_software_identity_status() == 0);
+        }
+        const char *invalid_macs[] = {"01:48:56:12:34:50", "2:48:56:12:34:50", "+2:48:56:12:34:50", "02:48:56:12:34:GG", "00:17:cb:12:34:50", "00:00:00:00:00:00"};
+        for (unsigned i = 0; i < sizeof invalid_macs / sizeof *invalid_macs; i++) {
+            setenv("HV_SOFTWARE_MAC", invalid_macs[i], 1);
+            rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
+            check("invalid native identity fails before boot and allows retry", rc != 0 && strstr(error, "identity is invalid") && henge_vm_can_start());
+        }
+        setenv("HV_SOFTWARE_MAC", "02:48:56:12:34:50", 1);
+        setenv("HV_SOFTWARE_MLB", "C07323700J9KXPG1H", 1);
+        rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
+        check("bad board checksum fails before boot", rc != 0 && henge_vm_can_start());
+        setenv("HV_SOFTWARE_MLB", "C07323700J9KXPG1M", 1);
+        expect_software_install = 1;
+        int before_install = memory_preparations, before_started = installer_started;
+        rc = henge_vm_install(rom, disk, aux, 1, "unused", dir, 64, 2, error, sizeof error);
+        check("installer reaches restore after memory preparation", rc != 0
+              && installer_started == before_started + 1 && strstr(error, "installer could not start") != NULL);
+        check("installer prepares VM memory", memory_preparations == before_install + 1);
+        check("the installer receives the same software identity", rc != 0 && installer_identity_observed);
+        check("installer lifetime still requires relaunch", henge_vm_state() == 2 && !henge_vm_can_start());
+        expect_software_install = 0;
+        unsetenv("HV_SOFTWARE_IDENTITY"); unsetenv("HV_SOFTWARE_SERIAL"); unsetenv("HV_SOFTWARE_MAC");
+        unsetenv("HV_SOFTWARE_MLB");
+    }
     hv_vm_destroy();
     atomic_store(&reader_done, 1);
     pthread_join(reader, NULL);
-    int before_install = memory_preparations;
-    check("installer reaches restore after memory preparation",
-          henge_vm_install(rom, disk, aux, 1, "unused", dir, 64, 2, error, sizeof error) != 0
-          && installer_started == 1 && strstr(error, "installer could not start") != NULL);
-    check("installer prepares VM memory", memory_preparations == before_install + 1);
-    /* The installer stub owns no USB workers, so the test can release its board. */
-    hv_vm_destroy();
     hv_jit_region_close(&jit);
     unlink(rom); unlink(disk); unlink(aux); rmdir(dir);
     printf("VM lifecycle: 12 power cycles, 3 failed boots, suspend/resume and installer preflight, %d failures\n", failures);

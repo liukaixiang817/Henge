@@ -9,6 +9,7 @@ import zipfile
 
 
 def validate(path, commit):
+    assert path.name in {"Henge.ipa", "Henge.tipa"}, "upstream package filename changed"
     with zipfile.ZipFile(path) as archive:
         assert archive.testzip() is None, "archive integrity failed"
         names = archive.namelist()
@@ -20,11 +21,11 @@ def validate(path, commit):
         root = "Payload/Henge.app/"
         info = plistlib.loads(archive.read(root + "Info.plist"))
         helper = plistlib.loads(archive.read(root + "PlugIns/HengeJITHelper.appex/Info.plist"))
-        assert info["CFBundleIdentifier"] == "com.henge.icloudsoftware"
-        assert info["CFBundleDisplayName"] == "Henge iCloud"
+        assert info["CFBundleIdentifier"] == "com.henge.app"
+        assert info["CFBundleDisplayName"] == "Henge"
         assert info["CFBundleShortVersionString"] == "0.3.0"
         assert info["CFBundleVersion"] == "104"
-        assert helper["CFBundleIdentifier"] == "com.henge.icloudsoftware.JITHelper"
+        assert helper["CFBundleIdentifier"] == "com.henge.app.JITHelper"
         assert helper["CFBundleVersion"] == "104"
         assert info.get("NSCameraUsageDescription") and info.get("NSMicrophoneUsageDescription")
         if commit:

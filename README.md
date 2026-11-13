@@ -31,6 +31,8 @@ and App Store downloads were tested in Henge's native Mac runner; this combined
 build still needs physical iPhone/iPad acceptance. iMessage/FaceTime delivery is
 not guaranteed. See the [implementation and service results](docs/apple-account-macos26-27-testing.md).
 Use **Actions → Build Henge IPA → Run workflow** on this branch for IPA/TIPA artifacts.
+The packages retain the upstream names `Henge.ipa` / `Henge.tipa`, app name
+`Henge`, and Bundle ID `com.henge.app` (helper: `com.henge.app.JITHelper`).
 
 - **Own emulator** — iOS gives apps no hypervisor, so Henge runs the Mac's arm64 code through its own JIT, with its own MMU and devices. It doesn't use QEMU or Virtualization.framework.
 - **Installs on the device** — Henge downloads Apple's restore image and restores it the way a Mac does. No Mac needed, and nothing is decrypted or patched.

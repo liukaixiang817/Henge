@@ -1,6 +1,6 @@
 # Manual builds of the selected iCloud branch. No account login runs in CI.
 name: Build Henge IPA
-run-name: Henge iCloud Build 104 - ${{ github.ref_name }}
+run-name: Henge Build 104 - ${{ github.ref_name }}
 
 on:
   workflow_dispatch: {}
@@ -79,11 +79,11 @@ jobs:
         working-directory: Henge
         run: make ios-lib
 
-      - name: Package iCloud IPA
+      - name: Package Henge.ipa
         working-directory: Henge
         run: zsh ios/scripts/package_ipa.sh
 
-      - name: Package iCloud TIPA
+      - name: Package Henge.tipa
         working-directory: Henge
         run: zsh ios/scripts/package_ipa.sh --trollstore
 
@@ -94,17 +94,17 @@ jobs:
             "$HOME/Desktop/Henge.ipa" "$HOME/Desktop/Henge.tipa" \
             --commit "$GITHUB_SHA" --output build/icloud-packages.json
 
-      - name: Upload iCloud IPA
+      - name: Upload Henge.ipa
         uses: actions/upload-artifact@v4
         with:
-          name: Henge-iCloud-Build104-ipa-${{ github.sha }}
+          name: Henge-ipa-${{ github.sha }}
           path: /Users/runner/Desktop/Henge.ipa
           if-no-files-found: error
 
-      - name: Upload iCloud TIPA
+      - name: Upload Henge.tipa
         uses: actions/upload-artifact@v4
         with:
-          name: Henge-iCloud-Build104-tipa-${{ github.sha }}
+          name: Henge-tipa-${{ github.sha }}
           path: /Users/runner/Desktop/Henge.tipa
           if-no-files-found: error
 
@@ -112,7 +112,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Henge-iCloud-Build104-validation-${{ github.sha }}
+          name: Henge-validation-${{ github.sha }}
           path: |
             Henge/build/icloud-packages.json
             Henge/build/icloud-native-regression.log

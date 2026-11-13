@@ -83,14 +83,19 @@ is no claim that every iCloud feature or either messaging service passes.
 
 ## Test package
 
-Build 104 is version 0.3.0, unsigned, with app ID `com.henge.icloudsoftware`.
+Current Build 104 packages retain version 0.3.0 and the upstream identity:
+`Henge.ipa` / `Henge.tipa`, app name `Henge`, app ID `com.henge.app`, and helper
+ID `com.henge.app.JITHelper`. They are built without a developer certificate
+and signed ad hoc for subsequent installation signing.
 It keeps PR #121's JIT reservation fix and the existing PR #100 media work.
 The compatibility switch is only available when creating a new Mac; existing
 machine identities are not replaced. Identity VMs use cold boots, without
 Instant Resume. The macOS 15.6.1 Build 103 checkpoint remains unchanged.
 
-IPA: `Henge-iCloud-macOS15-26-27-Build104-unsigned.ipa` in the main workspace's
-`build` directory. SHA-256:
+The original frozen local test package used the separate app ID
+`com.henge.icloudsoftware`; it is preserved for reference and is not the current
+Actions package. Original IPA: `Henge-iCloud-macOS15-26-27-Build104-unsigned.ipa`
+in the local checkpoint. Its SHA-256 is:
 `ed5eba6caefd980378f1ae48a527986dc90a63549e1996834554cb53ca44ac9c`.
 The source patch is based on PR #121 commit `3ff3bea` and includes no test
 credentials, diagnostic VM profiles, disks or restore images.
